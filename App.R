@@ -27,7 +27,7 @@ fuel_emission_factors <- list(
   "Heavy Fuels" = 0.025
 )
 
-# Photo guide lookup table for custom litter/duff calculator
+# litter/duff calculator
 photo_guide_options <- tribble(
   ~photo_id, ~site_type, ~ecozone, ~litter_factor, ~duff_factor,
   "P01", "Low elevation pine", "Coastal Plain", 1.38, 4.84,
@@ -230,7 +230,7 @@ ui <- page_sidebar(
     ),
     
     nav_panel(
-      "Litter and Duff Mass Calculator",
+      "litter/duff calculator",
       layout_columns(
         col_widths = c(4, 8),
         card(

@@ -1,20 +1,7 @@
-# Forest Management Smoke Plume Prediction App
-# Based on Gaussian Dispersion Model (VSmoke principles)
-# 
-# Required packages: shiny, tidyverse, DT, bslib, ggplot2
-# 
-# HOW TO RUN:
-# 1. Install required packages: install.packages(c("shiny", "tidyverse", "DT", "bslib", "ggplot2"))
-# 2. Save this code as app.R
-# 3. Run: shiny::runApp("app.R") or click "Run App" in RStudio
-# 4. The app will open in your browser
-# 5. Input burn parameters and click "Generate Smoke Prediction"
-
 library(shiny)
 library(tidyverse)
 library(DT)
 library(bslib)
-library(ggplot2)
 library(leaflet)
 
 # Gaussian Dispersion Model Functions
@@ -33,11 +20,22 @@ stability_params <- list(
 # Fuel load emission factors (tons particulate matter per ton fuel consumed)
 fuel_emission_factors <- list(
   "Grass" = 0.013,
-  "Shrub" = 0.016, 
+  "Shrub" = 0.016,
   "Hardwood Litter" = 0.018,
   "Conifer Litter" = 0.020,
   "Logging Slash" = 0.022,
   "Heavy Fuels" = 0.025
+)
+
+# Photo guide lookup table for custom litter/duff calculator
+photo_guide_options <- tribble(
+  ~photo_id, ~site_type, ~ecozone, ~litter_factor, ~duff_factor,
+  "P01", "Low elevation pine", "Coastal Plain", 1.38, 4.84,
+  "P02", "Upland mixed pine", "Coastal Plain", 1.52, 4.20,
+  "P03", "Pine-hardwood", "Piedmont", 1.61, 4.02,
+  "P04", "Mesic hardwood", "Piedmont", 1.77, 3.38,
+  "P05", "Oak-hickory", "Appalachian Foothills", 1.49, 3.82,
+  "P06", "Longleaf pine", "Sandhills", 1.30, 5.10
 )
 
 # Function to calculate dispersion coefficients
@@ -47,16 +45,16 @@ calc_dispersion_coeffs <- function(distance_km, stability_class) {
   # Horizontal dispersion coefficient (sigma_y)
   sigma_y <- params$a * distance_km^params$b
   
-  # Vertical dispersion coefficient (sigma_z)  
+  # Vertical dispersion coefficient (sigma_z)
   sigma_z <- params$c * distance_km^params$d
   
-  return(list(sigma_y = sigma_y, sigma_z = sigma_z))
+  list(sigma_y = sigma_y, sigma_z = sigma_z)
 }
 
 # Gaussian plume concentration calculation
 calc_concentration <- function(x, y, z, Q, u, H, stability_class) {
   # x: downwind distance (km)
-  # y: crosswind distance (km) 
+  # y: crosswind distance (km)
   # z: height above ground (m)
   # Q: emission rate (g/s)
   # u: wind speed (m/s)
@@ -74,12 +72,11 @@ calc_concentration <- function(x, y, z, Q, u, H, stability_class) {
   term2 <- exp(-0.5 * (y / sigma_y)^2)
   term3 <- exp(-0.5 * ((z - H) / sigma_z)^2) + exp(-0.5 * ((z + H) / sigma_z)^2)
   
-  concentration <- term1 * term2 * term3
-  return(concentration)
+  term1 * term2 * term3
 }
 
 # Generate smoke plume prediction grid
-generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, tons_per_acre, 
+generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, tons_per_acre,
                                  wind_speed = 5, wind_dir = 45, stability_class = "D") {
   
   # Calculate total emissions
@@ -95,16 +92,16 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
   
   # Create prediction grid (50km x 50km around burn site)
   grid_size <- 50  # km
-  resolution <- 1   # km
+  resolution <- 1  # km
   
-  x_seq <- seq(-grid_size/2, grid_size/2, by = resolution)
-  y_seq <- seq(-grid_size/2, grid_size/2, by = resolution)
+  x_seq <- seq(-grid_size / 2, grid_size / 2, by = resolution)
+  y_seq <- seq(-grid_size / 2, grid_size / 2, by = resolution)
   
-  grid <- expand_grid(x = x_seq, y = y_seq) %>%
+  expand_grid(x = x_seq, y = y_seq) %>%
     mutate(
       # Rotate coordinates based on wind direction
-      x_rot = x * cos(wind_dir * pi/180) - y * sin(wind_dir * pi/180),
-      y_rot = x * sin(wind_dir * pi/180) + y * cos(wind_dir * pi/180)
+      x_rot = x * cos(wind_dir * pi / 180) - y * sin(wind_dir * pi / 180),
+      y_rot = x * sin(wind_dir * pi / 180) + y * cos(wind_dir * pi / 180)
     ) %>%
     rowwise() %>%
     mutate(
@@ -117,7 +114,7 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
           u = wind_speed,
           H = H,
           stability_class = stability_class
-        ) * 1e6   # convert to μg/m³
+        ) * 1e6  # convert to μg/m³
       } else {
         0
       }
@@ -126,29 +123,28 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
     mutate(
       distance = sqrt(x_rot^2 + y_rot^2),
       lat_grid = lat + (y / 111.32),
-      lon_grid = lon + (x / (111.32 * cos(lat * pi/180)))
+      lon_grid = lon + (x / (111.32 * cos(lat * pi / 180)))
     ) %>%
     mutate(
       aqi_bin = cut(
         concentration,
         breaks = c(0, 12, 35.4, 55.4, 150.4, 250.4, Inf),
-        labels = c("0–50 (Good)",
-                   "51–100 (Moderate)",
-                   "101–150 (USG)",
-                   "151–200 (Unhealthy)",
-                   "201–300 (Very Unhealthy)",
-                   "301+ (Hazardous)"),
+        labels = c(
+          "0–50 (Good)",
+          "51–100 (Moderate)",
+          "101–150 (USG)",
+          "151–200 (Unhealthy)",
+          "201–300 (Very Unhealthy)",
+          "301+ (Hazardous)"
+        ),
         include.lowest = TRUE
       )
     ) %>%
-    filter(!is.na(aqi_bin)) %>%
-    
-    
-    
-    return(grid)
+    filter(!is.na(aqi_bin))
 }
+
 make_ellipse <- function(lon, lat, a_km, b_km, angle_deg, n = 60) {
-  theta <- seq(0, 2*pi, length.out = n)
+  theta <- seq(0, 2 * pi, length.out = n)
   angle <- angle_deg * pi / 180
   
   x <- a_km * cos(theta)
@@ -158,12 +154,10 @@ make_ellipse <- function(lon, lat, a_km, b_km, angle_deg, n = 60) {
   y_rot <- x * sin(angle) + y * cos(angle)
   
   tibble(
-    lng = lon + x_rot / (111.32 * cos(lat * pi/180)),
+    lng = lon + x_rot / (111.32 * cos(lat * pi / 180)),
     lat = lat + y_rot / 111.32
   )
 }
-
-
 
 # UI
 ui <- page_sidebar(
@@ -189,75 +183,99 @@ ui <- page_sidebar(
     
     # Fuel characteristics
     h4("🌿 Fuel Characteristics", style = "color: #2E8B57;"),
-    selectInput("fuel_type", "Fuel Type:",
-                choices = c("Grass", "Shrub", "Hardwood Litter", 
-                            "Conifer Litter", "Logging Slash", "Heavy Fuels"),
-                selected = "Hardwood Litter"),
+    selectInput(
+      "fuel_type", "Fuel Type:",
+      choices = c("Grass", "Shrub", "Hardwood Litter", "Conifer Litter", "Logging Slash", "Heavy Fuels"),
+      selected = "Hardwood Litter"
+    ),
     numericInput("fuel_load", "Fuel load (tons/acre):", value = 5, min = 0.1, max = 50, step = 0.1),
     
     # Weather parameters
     h4("🌤️ Weather Conditions", style = "color: #2E8B57;"),
     numericInput("wind_speed", "Wind speed (m/s):", value = 5, min = 1, max = 20, step = 0.5),
     numericInput("wind_direction", "Wind direction (degrees):", value = 45, min = 0, max = 360, step = 5),
-    selectInput("stability", "Atmospheric stability:",
-                choices = c("Very Unstable (A)" = "A", "Moderately Unstable (B)" = "B",
-                            "Slightly Unstable (C)" = "C", "Neutral (D)" = "D",
-                            "Slightly Stable (E)" = "E", "Moderately Stable (F)" = "F"),
-                selected = "D"),
+    selectInput(
+      "stability", "Atmospheric stability:",
+      choices = c(
+        "Very Unstable (A)" = "A", "Moderately Unstable (B)" = "B",
+        "Slightly Unstable (C)" = "C", "Neutral (D)" = "D",
+        "Slightly Stable (E)" = "E", "Moderately Stable (F)" = "F"
+      ),
+      selected = "D"
+    ),
     
     br(),
-    actionButton("predict", "🔍 Generate Smoke Prediction", 
-                 class = "btn-primary", style = "width: 100%;")
+    actionButton("predict", "🔍 Generate Smoke Prediction", class = "btn-primary", style = "width: 100%;")
   ),
   
   # Main panel
   navset_card_tab(
-    nav_panel("Smoke Plume Map",
-              value_box(
-                title = "Prediction Status",
-                value = textOutput("status_text"),
-                showcase = icon("wind"),
-                theme = "primary"
-              ),
-              br(),
-              leafletOutput("smoke_map", height = "600px") 
-              
+    nav_panel(
+      "Smoke Plume Map",
+      value_box(
+        title = "Prediction Status",
+        value = textOutput("status_text"),
+        showcase = icon("wind"),
+        theme = "primary"
+      ),
+      br(),
+      leafletOutput("smoke_map", height = "600px")
     ),
     
-    nav_panel("Prediction Data",
-              h4("Smoke Concentration Predictions"),
-              p("Concentrations shown in μg/m³ at 2m height above ground level."),
-              DTOutput("prediction_table")
+    nav_panel(
+      "Prediction Data",
+      h4("Smoke Concentration Predictions"),
+      p("Concentrations shown in μg/m³ at 2m height above ground level."),
+      DTOutput("prediction_table")
     ),
     
-    nav_panel("Model Information",
-              h4("Gaussian Dispersion Model Information"),
-              div(
-                h5("Model Basis:"),
-                p("This application implements a Gaussian plume dispersion model based on VSmoke 
-                  methodology for predicting smoke transport from prescribed burns."),
-                
-                h5("Key Parameters:"),
-                tags$ul(
-                  tags$li("Pasquill-Gifford atmospheric stability classes"),
-                  tags$li("Fuel-specific emission factors for particulate matter"),
-                  tags$li("Effective plume height based on fire intensity"),
-                  tags$li("Wind speed and direction effects on dispersion")
-                ),
-                
-                h5("Limitations:"),
-                tags$ul(
-                  tags$li("Simplified terrain assumptions (flat ground)"),
-                  tags$li("Steady-state atmospheric conditions"),
-                  tags$li("Point source approximation for burn area"),
-                  tags$li("Ground-level concentration predictions only")
-                ),
-                
-                h5("Usage Notes:"),
-                p("Click on the map to see concentration values at specific locations. 
-                  Red dot indicates the burn location. Contour lines show predicted 
-                  smoke concentration levels.")
-              )
+    nav_panel(
+      "Litter and Duff Mass Calculator",
+      layout_columns(
+        col_widths = c(4, 8),
+        card(
+          card_header("Photo Guide Inputs"),
+          selectInput("photo_option", "Photo guide option", choices = photo_guide_options$photo_id),
+          numericInput("litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
+          numericInput("duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1)
+        ),
+        card(
+          card_header("Estimated Fuel Loading"),
+          p("This custom tab mirrors the photo-guide workflow by combining selected site factors with measured depths."),
+          value_box(title = "Litter mass", value = textOutput("litter_mass_text"), theme = "success"),
+          value_box(title = "Duff mass", value = textOutput("duff_mass_text"), theme = "warning"),
+          value_box(title = "Total (litter + duff)", value = textOutput("total_mass_text"), theme = "primary"),
+          DTOutput("photo_factor_table")
+        )
+      )
+    ),
+    
+    nav_panel(
+      "Model Information",
+      h4("Gaussian Dispersion Model Information"),
+      div(
+        h5("Model Basis:"),
+        p("This application implements a Gaussian plume dispersion model based on VSmoke methodology for predicting smoke transport from prescribed burns."),
+        
+        h5("Key Parameters:"),
+        tags$ul(
+          tags$li("Pasquill-Gifford atmospheric stability classes"),
+          tags$li("Fuel-specific emission factors for particulate matter"),
+          tags$li("Effective plume height based on fire intensity"),
+          tags$li("Wind speed and direction effects on dispersion")
+        ),
+        
+        h5("Limitations:"),
+        tags$ul(
+          tags$li("Simplified terrain assumptions (flat ground)"),
+          tags$li("Steady-state atmospheric conditions"),
+          tags$li("Point source approximation for burn area"),
+          tags$li("Ground-level concentration predictions only")
+        ),
+        
+        h5("Usage Notes:"),
+        p("Click on the map to see concentration values at specific locations. Red dot indicates the burn location. Contour rings show predicted smoke concentration levels by AQI band.")
+      )
     )
   )
 )
@@ -278,13 +296,67 @@ server <- function(input, output, session) {
     values$status
   })
   
+  selected_photo <- reactive({
+    photo_guide_options %>%
+      filter(photo_id == input$photo_option) %>%
+      slice(1)
+  })
+  
+  photo_calc <- reactive({
+    option <- selected_photo()
+    req(nrow(option) == 1)
+    
+    litter_mass <- input$litter_depth * option$litter_factor
+    duff_mass <- input$duff_depth * option$duff_factor
+    
+    list(
+      litter_mass = litter_mass,
+      duff_mass = duff_mass,
+      total_mass = litter_mass + duff_mass,
+      option = option
+    )
+  })
+  
+  output$litter_mass_text <- renderText({
+    paste0(round(photo_calc()$litter_mass, 2), " tons/acre")
+  })
+  
+  output$duff_mass_text <- renderText({
+    paste0(round(photo_calc()$duff_mass, 2), " tons/acre")
+  })
+  
+  output$total_mass_text <- renderText({
+    paste0(round(photo_calc()$total_mass, 2), " tons/acre")
+  })
+  
+  output$photo_factor_table <- renderDT({
+    option <- photo_calc()$option
+    table_data <- tibble(
+      `Photo Option` = option$photo_id,
+      `Site Type` = option$site_type,
+      Ecozone = option$ecozone,
+      `Litter factor (tons/acre/in)` = option$litter_factor,
+      `Duff factor (tons/acre/in)` = option$duff_factor
+    )
+    
+    datatable(table_data, options = list(dom = "t"), rownames = FALSE)
+  })
+  
   # Generate smoke prediction
   observeEvent(input$predict, {
     values$status <- "Generating smoke plume prediction..."
     
     # Validate inputs
-    req(input$latitude, input$longitude, input$acres, input$duration,
-        input$fuel_type, input$fuel_load, input$wind_speed, input$wind_direction)
+    req(
+      input$latitude,
+      input$longitude,
+      input$acres,
+      input$duration,
+      input$fuel_type,
+      input$fuel_load,
+      input$wind_speed,
+      input$wind_direction
+    )
     
     # Store burn location
     values$burn_lat <- input$latitude
@@ -306,7 +378,6 @@ server <- function(input, output, session) {
       
       values$prediction_data <- prediction_data
       values$status <- "Prediction complete"
-      
     }, error = function(e) {
       values$status <- paste("Error generating prediction:", e$message)
       showNotification("Error generating smoke prediction. Please check inputs.", type = "error")
@@ -319,12 +390,12 @@ server <- function(input, output, session) {
     # AQI Color Palette
     pal <- colorFactor(
       palette = c(
-        "#00E400",  # Good
-        "#FFFF00",  # Moderate
-        "#FF7E00",  # USG
-        "#FF0000",  # Unhealthy
-        "#8F3F97",  # Very Unhealthy
-        "#7E0023"   # Hazardous
+        "#00E400", # Good
+        "#FFFF00", # Moderate
+        "#FF7E00", # USG
+        "#FF0000", # Unhealthy
+        "#8F3F97", # Very Unhealthy
+        "#7E0023"  # Hazardous
       ),
       domain = levels(values$prediction_data$aqi_bin)
     )
@@ -332,15 +403,14 @@ server <- function(input, output, session) {
     # Get max distance for each AQI category
     ellipse_data <- values$prediction_data %>%
       group_by(aqi_bin) %>%
-      summarise(max_dist = max(distance, na.rm = TRUE)) %>%
-      arrange(desc(max_dist))  # largest first
+      summarise(max_dist = max(distance, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(max_dist))
     
     m <- leaflet() %>%
       addProviderTiles(providers$Esri.WorldTopoMap)
     
     # Draw one ellipse per AQI category
-    for (i in 1:nrow(ellipse_data)) {
-      
+    for (i in seq_len(nrow(ellipse_data))) {
       ellipse_coords <- make_ellipse(
         lon = values$burn_lon,
         lat = values$burn_lat,
@@ -379,8 +449,6 @@ server <- function(input, output, session) {
       )
   })
   
-  
-  
   # Handle map clicks
   observeEvent(input$smoke_map_click, {
     req(values$prediction_data)
@@ -407,7 +475,6 @@ server <- function(input, output, session) {
     )
   })
   
-  
   # Render prediction data table
   output$prediction_table <- renderDT({
     req(values$prediction_data)
@@ -428,20 +495,24 @@ server <- function(input, output, session) {
         `Distance from source (km)` = round(`Distance from source (km)`, 2)
       )
     
-    datatable(table_data,
-              options = list(
-                pageLength = 15,
-                scrollX = TRUE,
-                columnDefs = list(list(className = 'dt-center', targets = "_all"))
-              ),
-              rownames = FALSE) %>%
-      formatStyle(columns = "Concentration (μg/m³)", 
-                  backgroundColor = styleInterval(c(10, 50, 100), 
-                                                  c("white", "yellow", "orange", "red")))
+    datatable(
+      table_data,
+      options = list(
+        pageLength = 15,
+        scrollX = TRUE,
+        columnDefs = list(list(className = "dt-center", targets = "_all"))
+      ),
+      rownames = FALSE
+    ) %>%
+      formatStyle(
+        columns = "Concentration (μg/m³)",
+        backgroundColor = styleInterval(c(10, 50, 100), c("white", "yellow", "orange", "red"))
+      )
   })
 }
 
 # Run the application
 shinyApp(ui = ui, server = server)
+
 
 

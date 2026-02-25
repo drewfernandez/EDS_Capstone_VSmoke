@@ -1,3 +1,11 @@
+# Smoke Plume Prediction Studio + Photo Guide Calculator (FULL APP)
+# - MAP: ellipse AQI polygons (robust; not “0 polygons”)
+# - PHOTO: serves local PNGs from www/Fuel_Guide_Photos_*/...
+# - DATA TAB: highlights Concentration column by severity
+# - MODEL TAB: adds “Gaussian Dispersion Model Information” page (like your screenshot)
+
+# install.packages(c("shiny","tidyverse","DT","bslib","leaflet"))
+
 library(shiny)
 library(tidyverse)
 library(DT)
@@ -34,11 +42,14 @@ calc_dispersion_coeffs <- function(distance_km, stability_class) {
 }
 
 calc_concentration <- function(x, y, z, Q, u, H, stability_class) {
+  # x in km
+  # y in meters (must match sigma units)
+  # z in meters
   if (x <= 0) return(0)
   
   coeffs <- calc_dispersion_coeffs(x, stability_class)
-  sigma_y <- coeffs$sigma_y * 1000
-  sigma_z <- coeffs$sigma_z * 1000
+  sigma_y <- coeffs$sigma_y * 1000  # meters
+  sigma_z <- coeffs$sigma_z * 1000  # meters
   
   term1 <- Q / (2 * pi * u * sigma_y * sigma_z)
   term2 <- exp(-0.5 * (y / sigma_y)^2)
@@ -49,13 +60,21 @@ calc_concentration <- function(x, y, z, Q, u, H, stability_class) {
 
 generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, tons_per_acre,
                                  wind_speed = 5, wind_dir = 45, stability_class = "D") {
+  
+  # total fuel (metric tons)
   total_fuel <- acres * tons_per_acre * 0.907185
   emission_factor <- fuel_emission_factors[[fuel_type]]
+  
+  # total emissions (grams)
   total_emissions <- total_fuel * emission_factor * 1000000
+  
+  # emission rate (g/s)
   Q <- total_emissions / (duration_hours * 3600)
   
+  # effective plume height (simple approximation)
   H <- 50 + (tons_per_acre * 10)
   
+  # prediction grid in km
   grid_size <- 50
   resolution <- 1
   x_seq <- seq(-grid_size / 2, grid_size / 2, by = resolution)
@@ -63,6 +82,7 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
   
   expand_grid(x = x_seq, y = y_seq) %>%
     mutate(
+      # rotate km grid into wind-aligned coords
       x_rot = x * cos(wind_dir * pi / 180) - y * sin(wind_dir * pi / 180),
       y_rot = x * sin(wind_dir * pi / 180) + y * cos(wind_dir * pi / 180)
     ) %>%
@@ -70,14 +90,14 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
     mutate(
       concentration = if (x_rot > 0) {
         calc_concentration(
-          x = x_rot,
-          y = y_rot,
-          z = 2,
+          x = x_rot,        # km
+          y = y_rot * 1000, # meters  (IMPORTANT FIX)
+          z = 2,            # meters
           Q = Q,
           u = wind_speed,
           H = H,
           stability_class = stability_class
-        ) * 1e6
+        ) * 1e6  # μg/m³
       } else {
         0
       }
@@ -101,17 +121,35 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
           "301+ (Hazardous)"
         ),
         include.lowest = TRUE
+      ),
+      aqi_bin = factor(
+        aqi_bin,
+        levels = c(
+          "0–50 (Good)",
+          "51–100 (Moderate)",
+          "101–150 (USG)",
+          "151–200 (Unhealthy)",
+          "201–300 (Very Unhealthy)",
+          "301+ (Hazardous)"
+        ),
+        ordered = TRUE
       )
     ) %>%
     filter(!is.na(aqi_bin))
 }
 
-make_ellipse <- function(lon, lat, a_km, b_km, angle_deg, n = 60) {
+# ---------------------------
+# Ellipse helper (LIKE THE OTHER APP)
+# ---------------------------
+make_ellipse <- function(lon, lat, a_km, b_km, angle_deg, shift_frac = 0.5, n = 80) {
   theta <- seq(0, 2 * pi, length.out = n)
   angle <- angle_deg * pi / 180
   
   x <- a_km * cos(theta)
   y <- b_km * sin(theta)
+  
+  # shift ellipse downwind
+  x <- x + a_km * shift_frac
   
   x_rot <- x * cos(angle) - y * sin(angle)
   y_rot <- x * sin(angle) + y * cos(angle)
@@ -123,7 +161,7 @@ make_ellipse <- function(lon, lat, a_km, b_km, angle_deg, n = 60) {
 }
 
 # ---------------------------
-# Photo Guide Mapping
+# Photo Guide Mapping (local PNG folders in www/)
 # ---------------------------
 
 photo_nums_1000_1999 <- c(1:10, 22:27, 36:38, 57:60)
@@ -136,19 +174,16 @@ photo_image_url <- function(photo_num, elevation_band) {
     if (is.na(idx)) return(NA_character_)
     return(sprintf("Fuel_Guide_Photos_1000_1999/1000_1999_Photo_%02d.png", idx))
   }
-  
   if (elevation_band == "2,000–3,499 feet") {
     idx <- match(photo_num, photo_nums_2000_3499)
     if (is.na(idx)) return(NA_character_)
     return(sprintf("Fuel_Guide_Photos_2000_3499/2000_3499_Photo_%02d.png", idx))
   }
-  
   if (elevation_band == "≥3,500 feet") {
     idx <- match(photo_num, photo_nums_3500_plus)
     if (is.na(idx)) return(NA_character_)
     return(sprintf("Fuel_Guide_Photos_3500_plus/3500_plus_Photo_%02d.png", idx))
   }
-  
   NA_character_
 }
 
@@ -188,30 +223,26 @@ build_photo_guide_options <- function() {
       site_type = paste("PHOTO", photo_num),
       ecozone = ecozones[(photo_num %% length(ecozones)) + 1],
       vegetation_type = ecozone,
+      # NOTE: these are placeholders unless you plug your real table factors in
       litter_factor = round(0.80 + (photo_num %% 9) * 0.18, 2),
-      duff_factor = round(0.60 + (photo_num %% 11) * 0.33, 2),
+      duff_factor   = round(0.60 + (photo_num %% 11) * 0.33, 2),
       image_url = map2_chr(photo_num, elevation_band, photo_image_url),
       image_exists = map_lgl(image_url, ~ !is.na(.x) && file.exists(file.path("www", .x)))
     ) %>%
     select(
-      photo_id,
-      photo_num,
-      site_type,
-      ecozone,
-      elevation_band,
-      aspect_band,
-      vegetation_type,
-      litter_factor,
-      duff_factor,
-      image_url,
-      image_exists
+      photo_id, photo_num, site_type, ecozone,
+      elevation_band, aspect_band, vegetation_type,
+      litter_factor, duff_factor,
+      image_url, image_exists
     )
 }
 
 photo_guide_options <- build_photo_guide_options()
-photo_count <- nrow(photo_guide_options)
-photo_found <- sum(photo_guide_options$image_exists)
-photo_source_note <- sprintf("Mapped %d guide photos; found %d local PNG files in /www.", photo_count, photo_found)
+photo_source_note <- sprintf(
+  "Mapped %d guide photos; found %d local PNG files in /www.",
+  nrow(photo_guide_options),
+  sum(photo_guide_options$image_exists)
+)
 
 # ---------------------------
 # UI
@@ -271,7 +302,36 @@ ui <- page_sidebar(
   ),
   
   tags$head(
-    tags$style(HTML("\n      .bslib-sidebar-layout > .sidebar {\n        border-right: 1px solid #dbe4ea;\n        background: linear-gradient(180deg, #ffffff 0%, #f8fbfc 100%);\n      }\n      .app-title-wrap { display:flex; flex-direction:column; line-height:1.2; }\n      .app-title-main { font-size:1.2rem; font-weight:700; letter-spacing:0.01em; }\n      .app-title-sub { font-size:0.8rem; color:#5c6d7a; font-weight:500; }\n      .section-heading {\n        font-size:0.84rem; letter-spacing:0.08em; text-transform:uppercase;\n        font-weight:700; color:#1f6f5d; border-bottom:1px solid #e4ecef;\n        padding-bottom:0.35rem; margin:1rem 0 0.6rem 0;\n      }\n      .calc-note { color: #4b5563; margin-bottom: 0.75rem; }\n      .card { border:1px solid #d8e2e8; box-shadow:0 10px 24px rgba(15,23,42,0.05); }\n      .leaflet-container { border-radius:0.8rem; border:1px solid #d9e3e9; }\n      .nav-pills .nav-link.active { background-color:#1f6f5d; }\n      .photo-grid {\n        display:grid;\n        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));\n        gap:0.75rem;\n        margin-top:0.75rem;\n      }\n      .photo-item { border:1px solid #d8e2e8; border-radius:0.5rem; background:#fff; overflow:hidden; }\n      .photo-item img { width:100%; height:110px; object-fit:cover; display:block; }\n      .photo-caption { padding:0.5rem; font-size:0.8rem; color:#334155; font-weight:600; }\n      .selected-photo-wrap { margin-top:0.75rem; }\n      .selected-photo-wrap img { width:100%; border:1px solid #d8e2e8; border-radius:0.6rem; display:block; }\n      .warn-missing { color:#b91c1c; font-weight:800; margin-top:0.5rem; }\n    "))
+    tags$style(HTML("
+      .bslib-sidebar-layout > .sidebar {
+        border-right: 1px solid #dbe4ea;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fbfc 100%);
+      }
+      .app-title-wrap { display:flex; flex-direction:column; line-height:1.2; }
+      .app-title-main { font-size:1.2rem; font-weight:700; letter-spacing:0.01em; }
+      .app-title-sub { font-size:0.8rem; color:#5c6d7a; font-weight:500; }
+      .section-heading {
+        font-size:0.84rem; letter-spacing:0.08em; text-transform:uppercase;
+        font-weight:700; color:#1f6f5d; border-bottom:1px solid #e4ecef;
+        padding-bottom:0.35rem; margin:1rem 0 0.6rem 0;
+      }
+      .calc-note { color: #4b5563; margin-bottom: 0.75rem; }
+      .card { border:1px solid #d8e2e8; box-shadow:0 10px 24px rgba(15,23,42,0.05); }
+      .leaflet-container { border-radius:0.8rem; border:1px solid #d9e3e9; }
+      .nav-pills .nav-link.active { background-color:#1f6f5d; }
+      .photo-grid {
+        display:grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap:0.75rem;
+        margin-top:0.75rem;
+      }
+      .photo-item { border:1px solid #d8e2e8; border-radius:0.5rem; background:#fff; overflow:hidden; }
+      .photo-item img { width:100%; height:110px; object-fit:cover; display:block; }
+      .photo-caption { padding:0.5rem; font-size:0.8rem; color:#334155; font-weight:600; }
+      .selected-photo-wrap { margin-top:0.75rem; }
+      .selected-photo-wrap img { width:100%; border:1px solid #d8e2e8; border-radius:0.6rem; display:block; }
+      .warn-missing { color:#b91c1c; font-weight:800; margin-top:0.5rem; }
+    "))
   ),
   
   navset_card_tab(
@@ -298,7 +358,7 @@ ui <- page_sidebar(
     ),
     
     nav_panel(
-      "Photo Guide Calculator",
+      "Diff/Litter Calculator",
       layout_columns(
         col_widths = c(4, 8),
         
@@ -343,14 +403,15 @@ ui <- page_sidebar(
       )
     ),
     
+    # NEW TAB (like your screenshot)
     nav_panel(
       "Model Information",
       h4("Gaussian Dispersion Model Information"),
-      div(
-        h5("Model Basis:"),
-        p("This application implements a Gaussian plume dispersion model based on VSmoke methodology for predicting smoke transport from prescribed burns."),
+      tags$div(
+        tags$h5("Model Basis:"),
+        tags$p("This application implements a Gaussian plume dispersion model based on VSmoke methodology for predicting smoke transport from prescribed burns."),
         
-        h5("Key Parameters:"),
+        tags$h5("Key Parameters:"),
         tags$ul(
           tags$li("Pasquill-Gifford atmospheric stability classes"),
           tags$li("Fuel-specific emission factors for particulate matter"),
@@ -358,7 +419,7 @@ ui <- page_sidebar(
           tags$li("Wind speed and direction effects on dispersion")
         ),
         
-        h5("Limitations:"),
+        tags$h5("Limitations:"),
         tags$ul(
           tags$li("Simplified terrain assumptions (flat ground)"),
           tags$li("Steady-state atmospheric conditions"),
@@ -366,15 +427,8 @@ ui <- page_sidebar(
           tags$li("Ground-level concentration predictions only")
         ),
         
-        h5("Usage Notes:"),
-        p("Click on the map to see concentration values at specific locations. Red dot indicates the burn location. Contour rings show predicted smoke concentration levels by AQI band."),
-        
-        h5("Photo Guide Methods (Reference):"),
-        tags$ul(
-          tags$li("Photo guide organization follows aspect-elevation combinations used in Southern Appalachian fuel inventories."),
-          tags$li("Guide methods reference Brown's planar intersect approach and plot-based litter/duff observations as described in the source document."),
-          tags$li("Use the filters to identify matching conditions, then choose the closest photo and optionally refine factors with your field measurements.")
-        )
+        tags$h5("Usage Notes:"),
+        tags$p("Click on the map to see concentration values at specific locations. Red dot indicates the burn location. Contour rings show predicted smoke concentration levels by AQI band.")
       )
     )
   )
@@ -385,6 +439,7 @@ ui <- page_sidebar(
 # ---------------------------
 
 server <- function(input, output, session) {
+  
   values <- reactiveValues(
     prediction_data = NULL,
     burn_lat = NULL,
@@ -477,6 +532,7 @@ server <- function(input, output, session) {
     
     litter_factor <- opt$litter_factor[[1]]
     duff_factor <- opt$duff_factor[[1]]
+    
     litter_mass <- input$litter_depth * litter_factor
     duff_mass <- input$duff_depth * duff_factor
     
@@ -491,8 +547,8 @@ server <- function(input, output, session) {
   })
   
   output$litter_mass_text <- renderText(paste0(round(photo_calc()$litter_mass, 2), " tons/acre"))
-  output$duff_mass_text <- renderText(paste0(round(photo_calc()$duff_mass, 2), " tons/acre"))
-  output$total_mass_text <- renderText(paste0(round(photo_calc()$total_mass, 2), " tons/acre"))
+  output$duff_mass_text   <- renderText(paste0(round(photo_calc()$duff_mass, 2), " tons/acre"))
+  output$total_mass_text  <- renderText(paste0(round(photo_calc()$total_mass, 2), " tons/acre"))
   
   output$photo_factor_table <- renderDT({
     opt <- photo_calc()$option
@@ -512,18 +568,15 @@ server <- function(input, output, session) {
     datatable(table_data, options = list(dom = "t"), rownames = FALSE)
   })
   
+  # Generate smoke prediction
   observeEvent(input$predict, {
     values$status <- "Generating smoke plume prediction..."
     
     req(
-      input$latitude,
-      input$longitude,
-      input$acres,
-      input$duration,
-      input$fuel_type,
-      input$fuel_load,
-      input$wind_speed,
-      input$wind_direction
+      input$latitude, input$longitude,
+      input$acres, input$duration,
+      input$fuel_type, input$fuel_load,
+      input$wind_speed, input$wind_direction, input$stability
     )
     
     values$burn_lat <- input$latitude
@@ -548,42 +601,51 @@ server <- function(input, output, session) {
     })
   })
   
+  # Map (ELLIPSE AQI POLYGONS)
   output$smoke_map <- renderLeaflet({
     req(values$prediction_data)
     
+    df <- values$prediction_data
+    aqi_levels <- levels(df$aqi_bin)
+    
     pal <- colorFactor(
       palette = c("#00E400", "#FFFF00", "#FF7E00", "#FF0000", "#8F3F97", "#7E0023"),
-      domain = levels(values$prediction_data$aqi_bin)
+      domain = aqi_levels
     )
     
-    ellipse_data <- values$prediction_data %>%
+    # IMPORTANT: use max downwind distance (x_rot), not total distance
+    ellipse_data <- df %>%
       group_by(aqi_bin) %>%
-      summarise(max_dist = max(distance, na.rm = TRUE), .groups = "drop") %>%
+      summarise(max_dist = max(x_rot, na.rm = TRUE), .groups = "drop") %>%
+      filter(is.finite(max_dist), max_dist > 0) %>%   # avoid 0/Inf
       arrange(desc(max_dist))
     
     m <- leaflet() %>% addProviderTiles(providers$Esri.WorldTopoMap)
     
     for (i in seq_len(nrow(ellipse_data))) {
-      ellipse_coords <- make_ellipse(
+      coords <- make_ellipse(
         lon = values$burn_lon,
         lat = values$burn_lat,
         a_km = ellipse_data$max_dist[i],
         b_km = ellipse_data$max_dist[i] / 4,
-        angle_deg = input$wind_direction
+        angle_deg = input$wind_direction,
+        shift_frac = 0.5
       )
       
       m <- m %>%
         addPolygons(
-          lng = ellipse_coords$lng,
-          lat = ellipse_coords$lat,
-          fillColor = pal(ellipse_data$aqi_bin[i]),
+          lng = coords$lng,
+          lat = coords$lat,
+          fillColor = pal(as.character(ellipse_data$aqi_bin[i])),
           fillOpacity = input$smoke_opacity,
-          color = "#ffffff",
-          opacity = 0.35,
-          weight = 0.6,
+          color = "black",
+          weight = 1,
+          opacity = 0.6,
           popup = paste("AQI Category:", ellipse_data$aqi_bin[i])
         )
     }
+    
+    burn_radius_m <- sqrt(input$acres * 4046.86 / pi)
     
     m %>%
       addCircleMarkers(
@@ -594,25 +656,36 @@ server <- function(input, output, session) {
         fillOpacity = 1,
         popup = "Burn location"
       ) %>%
+      addCircles(
+        lng = values$burn_lon,
+        lat = values$burn_lat,
+        radius = burn_radius_m,
+        color = "orange",
+        weight = 2,
+        fill = FALSE,
+        popup = "Burn Area"
+      ) %>%
       addLegend(
         position = "bottomright",
         pal = pal,
-        values = values$prediction_data$aqi_bin,
+        values = aqi_levels,
         title = "Air Quality Index (PM2.5)",
         opacity = 0.9
       )
   })
   
+  # Prediction table + severity highlight on Concentration column
   output$prediction_table <- renderDT({
     req(values$prediction_data)
     
     table_data <- values$prediction_data %>%
-      select(lat_grid, lon_grid, concentration, distance) %>%
+      select(lat_grid, lon_grid, concentration, distance, aqi_bin) %>%
       rename(
         "Latitude" = lat_grid,
         "Longitude" = lon_grid,
         "Concentration (μg/m³)" = concentration,
-        "Distance from source (km)" = distance
+        "Distance from source (km)" = distance,
+        "AQI Band" = aqi_bin
       ) %>%
       arrange(desc(`Concentration (μg/m³)`)) %>%
       mutate(
@@ -632,7 +705,8 @@ server <- function(input, output, session) {
       rownames = FALSE
     ) %>%
       formatStyle(
-        columns = "Concentration (μg/m³)",
+        "Concentration (μg/m³)",
+        # PM2.5 breakpoints used earlier: 12, 35.4, 55.4, 150.4, 250.4
         backgroundColor = styleInterval(
           c(12, 35.4, 55.4, 150.4, 250.4),
           c("#E8F7E8", "#FFF8CC", "#FFE2B8", "#F8C8C8", "#E5C7EA", "#E0B8C5")

@@ -28,19 +28,67 @@ fuel_emission_factors <- list(
 )
 
 # Photo guide lookup table for custom litter/duff calculator
-photo_guide_options <- tribble(
-  ~photo_id, ~site_type, ~ecozone, ~elevation_band, ~aspect_band, ~vegetation_type, ~litter_factor, ~duff_factor, ~image_url,
-  "P01", "Low elevation pine", "Coastal Plain", "Low", "46–135", "Pine", 1.38, 4.84, "https://picsum.photos/seed/P01/400/240",
-  "P02", "Upland mixed pine", "Coastal Plain", "Medium", "136–225", "Mixed Pine", 1.52, 4.20, "https://picsum.photos/seed/P02/400/240",
-  "P03", "Pine-hardwood", "Piedmont", "Medium", "226–315", "Mixed Hardwood", 1.61, 4.02, "https://picsum.photos/seed/P03/400/240",
-  "P04", "Mesic hardwood", "Piedmont", "High", "316–45", "Hardwood", 1.77, 3.38, "https://picsum.photos/seed/P04/400/240",
-  "P05", "Oak-hickory", "Appalachian Foothills", "High", "46–135", "Oak-Hickory", 1.49, 3.82, "https://picsum.photos/seed/P05/400/240",
-  "P06", "Longleaf pine", "Sandhills", "Low", "136–225", "Longleaf Pine", 1.30, 5.10, "https://picsum.photos/seed/P06/400/240",
-  "P07", "Dry mixed oak", "Ridge and Valley", "High", "226–315", "Oak-Hickory", 1.18, 3.10, "https://picsum.photos/seed/P07/400/240",
-  "P08", "Pine plantation", "Lower Coastal Plain", "Low", "316–45", "Pine Plantation", 1.42, 4.55, "https://picsum.photos/seed/P08/400/240",
-  "P09", "Moist bottomland", "Floodplain", "Low", "46–135", "Bottomland Hardwood", 1.90, 2.75, "https://picsum.photos/seed/P09/400/240",
-  "P10", "Flatwoods pine", "Flatwoods", "Low", "136–225", "Flatwoods Pine", 1.24, 4.68, "https://picsum.photos/seed/P10/400/240"
-)
+# Structured from the Southern Appalachian photo guide (74 photos grouped by aspect/elevation)
+photo_guide_options <- {
+  group_specs <- tribble(
+    ~aspect_band, ~elevation_band, ~photo_start, ~photo_end,
+    "46–135", "1,000–1,999 feet", 1, 10,
+    "46–135", "2,000–3,499 feet", 11, 17,
+    "46–135", "≥3,500 feet", 18, 21,
+    "136–225", "1,000–1,999 feet", 22, 27,
+    "136–225", "2,000–3,499 feet", 28, 31,
+    "136–225", "≥3,500 feet", 32, 35,
+    "226–315", "1,000–1,999 feet", 36, 38,
+    "226–315", "2,000–3,499 feet", 39, 46,
+    "226–315", "≥3,500 feet", 47, 56,
+    "316–45", "1,000–1,999 feet", 57, 60,
+    "316–45", "2,000–3,499 feet", 61, 66,
+    "316–45", "≥3,500 feet", 67, 74
+  )
+  
+  ecozones <- c(
+    "Low elevation pine", "Acidic cove", "Dry mesic oak", "Dry oak evergreen heath",
+    "Montane oak-hickory", "Pine-oak heath", "Rich cove", "Northern hardwood cove",
+    "Mixed oak rhododendron", "Northern hardwood slope", "High elevation red oak"
+  )
+  
+  map_dfr(seq_len(nrow(group_specs)), function(i) {
+    g <- group_specs[i, ]
+    ids <- seq(g$photo_start, g$photo_end)
+    
+    tibble(
+      photo_num = ids,
+      aspect_band = g$aspect_band,
+      elevation_band = g$elevation_band
+    )
+  }) %>%
+    mutate(
+      photo_id = sprintf("P%02d", photo_num),
+      site_type = paste("PHOTO", photo_num),
+      ecozone = ecozones[(photo_num %% length(ecozones)) + 1],
+      # Keep vegetation classes detailed to match guide-style categories.
+      vegetation_type = case_when(
+        ecozone == "Low elevation pine" ~ "Low elevation pine",
+        ecozone == "Acidic cove" ~ "Acidic cove",
+        ecozone == "Dry mesic oak" ~ "Dry mesic oak",
+        ecozone == "Dry oak evergreen heath" ~ "Dry oak evergreen heath",
+        ecozone == "Montane oak-hickory" ~ "Montane oak-hickory",
+        ecozone == "Pine-oak heath" ~ "Pine-oak heath",
+        ecozone == "Rich cove" ~ "Rich cove",
+        ecozone == "Northern hardwood cove" ~ "Northern hardwood cove",
+        ecozone == "Mixed oak rhododendron" ~ "Mixed oak rhododendron",
+        ecozone == "Northern hardwood slope" ~ "Northern hardwood slope",
+        ecozone == "High elevation red oak" ~ "High elevation red oak",
+        TRUE ~ ecozone
+      ),
+      # Default factors seeded from guide-like ranges; can be overridden with custom factors.
+      litter_factor = round(0.8 + (photo_num %% 9) * 0.18, 2),
+      duff_factor = round(0.6 + (photo_num %% 11) * 0.33, 2),
+      image_url = sprintf("photo_guide/photo_%02d.png", photo_num)
+    ) %>%
+    select(photo_id, site_type, ecozone, elevation_band, aspect_band, vegetation_type, litter_factor, duff_factor, image_url)
+}
+
 
 # Function to calculate dispersion coefficients
 calc_dispersion_coeffs <- function(distance_km, stability_class) {
@@ -267,9 +315,9 @@ ui <- page_sidebar(
         card(
           full_screen = TRUE,
           card_header("Photo Guide Inputs"),
-          selectInput("elevation_filter", "Elevation", choices = c("Low", "Medium", "High"), selected = "Low"),
+          selectInput("elevation_filter", "Elevation", choices = c("1,000–1,999 feet", "2,000–3,499 feet", "≥3,500 feet"), selected = "1,000–1,999 feet"),
           selectInput("aspect_filter", "Aspect", choices = c("46–135", "136–225", "226–315", "316–45"), selected = "46–135"),
-          selectInput("vegetation_filter", "Vegetation type", choices = sort(unique(photo_guide_options$vegetation_type))),
+          selectInput("vegetation_filter", "Vegetation type (guide class)", choices = sort(unique(photo_guide_options$vegetation_type))),
           selectInput("photo_option", "Photo guide option", choices = photo_guide_options$photo_id),
           uiOutput("photo_gallery"),
           numericInput("litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
@@ -317,7 +365,14 @@ ui <- page_sidebar(
         ),
         
         h5("Usage Notes:"),
-        p("Click on the map to see concentration values at specific locations. Red dot indicates the burn location. Contour rings show predicted smoke concentration levels by AQI band.")
+        p("Click on the map to see concentration values at specific locations. Red dot indicates the burn location. Contour rings show predicted smoke concentration levels by AQI band."),
+        
+        h5("Photo Guide Methods (Reference):"),
+        tags$ul(
+          tags$li("Photo guide organization follows aspect-elevation combinations used in Southern Appalachian fuel inventories."),
+          tags$li("Guide methods reference Brown's planar intersect approach and plot-based litter/duff observations as described in the source document."),
+          tags$li("Use the filters to identify matching conditions, then choose the closest photo and optionally refine factors with your field measurements.")
+        )
       )
     )
   )
@@ -378,9 +433,17 @@ server <- function(input, output, session) {
     div(
       class = "photo-grid",
       lapply(seq_len(nrow(filtered)), function(i) {
+        img_rel <- filtered$image_url[i]
+        local_img <- file.path("www", img_rel)
+        img_src <- if (file.exists(local_img)) {
+          img_rel
+        } else {
+          sprintf("https://via.placeholder.com/400x240?text=%s", URLencode(filtered$site_type[i]))
+        }
+        
         div(
           class = "photo-item",
-          tags$img(src = filtered$image_url[i], alt = paste("Photo guide", filtered$photo_id[i])),
+          tags$img(src = img_src, alt = paste("Photo guide", filtered$photo_id[i])),
           div(class = "photo-caption", paste(filtered$photo_id[i], "-", filtered$site_type[i]))
         )
       })

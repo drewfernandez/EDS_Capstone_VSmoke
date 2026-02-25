@@ -29,17 +29,17 @@ fuel_emission_factors <- list(
 
 # Photo guide lookup table for custom litter/duff calculator
 photo_guide_options <- tribble(
-  ~photo_id, ~site_type, ~ecozone, ~litter_factor, ~duff_factor,
-  "P01", "Low elevation pine", "Coastal Plain", 1.38, 4.84,
-  "P02", "Upland mixed pine", "Coastal Plain", 1.52, 4.20,
-  "P03", "Pine-hardwood", "Piedmont", 1.61, 4.02,
-  "P04", "Mesic hardwood", "Piedmont", 1.77, 3.38,
-  "P05", "Oak-hickory", "Appalachian Foothills", 1.49, 3.82,
-  "P06", "Longleaf pine", "Sandhills", 1.30, 5.10,
-  "P07", "Dry mixed oak", "Ridge and Valley", 1.18, 3.10,
-  "P08", "Pine plantation", "Lower Coastal Plain", 1.42, 4.55,
-  "P09", "Moist bottomland", "Floodplain", 1.90, 2.75,
-  "P10", "Flatwoods pine", "Flatwoods", 1.24, 4.68
+  ~photo_id, ~site_type, ~ecozone, ~elevation_band, ~aspect_band, ~vegetation_type, ~litter_factor, ~duff_factor, ~image_url,
+  "P01", "Low elevation pine", "Coastal Plain", "Low", "46–135", "Pine", 1.38, 4.84, "https://picsum.photos/seed/P01/400/240",
+  "P02", "Upland mixed pine", "Coastal Plain", "Medium", "136–225", "Mixed Pine", 1.52, 4.20, "https://picsum.photos/seed/P02/400/240",
+  "P03", "Pine-hardwood", "Piedmont", "Medium", "226–315", "Mixed Hardwood", 1.61, 4.02, "https://picsum.photos/seed/P03/400/240",
+  "P04", "Mesic hardwood", "Piedmont", "High", "316–45", "Hardwood", 1.77, 3.38, "https://picsum.photos/seed/P04/400/240",
+  "P05", "Oak-hickory", "Appalachian Foothills", "High", "46–135", "Oak-Hickory", 1.49, 3.82, "https://picsum.photos/seed/P05/400/240",
+  "P06", "Longleaf pine", "Sandhills", "Low", "136–225", "Longleaf Pine", 1.30, 5.10, "https://picsum.photos/seed/P06/400/240",
+  "P07", "Dry mixed oak", "Ridge and Valley", "High", "226–315", "Oak-Hickory", 1.18, 3.10, "https://picsum.photos/seed/P07/400/240",
+  "P08", "Pine plantation", "Lower Coastal Plain", "Low", "316–45", "Pine Plantation", 1.42, 4.55, "https://picsum.photos/seed/P08/400/240",
+  "P09", "Moist bottomland", "Floodplain", "Low", "46–135", "Bottomland Hardwood", 1.90, 2.75, "https://picsum.photos/seed/P09/400/240",
+  "P10", "Flatwoods pine", "Flatwoods", "Low", "136–225", "Flatwoods Pine", 1.24, 4.68, "https://picsum.photos/seed/P10/400/240"
 )
 
 # Function to calculate dispersion coefficients
@@ -219,7 +219,7 @@ ui <- page_sidebar(
   
   # Main panel
   tags$head(
-    tags$style(HTML("\n      .bslib-sidebar-layout > .sidebar {\n        border-right: 1px solid #dbe4ea;\n        background: linear-gradient(180deg, #ffffff 0%, #f8fbfc 100%);\n      }\n      .app-title-wrap {\n        display: flex;\n        flex-direction: column;\n        line-height: 1.2;\n      }\n      .app-title-main {\n        font-size: 1.2rem;\n        font-weight: 700;\n        letter-spacing: 0.01em;\n      }\n      .app-title-sub {\n        font-size: 0.8rem;\n        color: #5c6d7a;\n        font-weight: 500;\n      }\n      .section-heading {\n        font-size: 0.84rem;\n        letter-spacing: 0.08em;\n        text-transform: uppercase;\n        font-weight: 700;\n        color: #1f6f5d;\n        border-bottom: 1px solid #e4ecef;\n        padding-bottom: 0.35rem;\n        margin: 1rem 0 0.6rem 0;\n      }\n      .kpi-row {\n        margin-bottom: 0.8rem;\n      }\n      .calc-note {\n        color: #4b5563;\n        margin-bottom: 1rem;\n      }\n      .card {\n        border: 1px solid #d8e2e8;\n        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);\n      }\n      .leaflet-container {\n        border-radius: 0.8rem;\n        border: 1px solid #d9e3e9;\n      }\n      .nav-pills .nav-link.active {\n        background-color: #1f6f5d;\n      }\n    "))
+    tags$style(HTML("\n      .bslib-sidebar-layout > .sidebar {\n        border-right: 1px solid #dbe4ea;\n        background: linear-gradient(180deg, #ffffff 0%, #f8fbfc 100%);\n      }\n      .app-title-wrap {\n        display: flex;\n        flex-direction: column;\n        line-height: 1.2;\n      }\n      .app-title-main {\n        font-size: 1.2rem;\n        font-weight: 700;\n        letter-spacing: 0.01em;\n      }\n      .app-title-sub {\n        font-size: 0.8rem;\n        color: #5c6d7a;\n        font-weight: 500;\n      }\n      .section-heading {\n        font-size: 0.84rem;\n        letter-spacing: 0.08em;\n        text-transform: uppercase;\n        font-weight: 700;\n        color: #1f6f5d;\n        border-bottom: 1px solid #e4ecef;\n        padding-bottom: 0.35rem;\n        margin: 1rem 0 0.6rem 0;\n      }\n      .kpi-row {\n        margin-bottom: 0.8rem;\n      }\n      .calc-note {\n        color: #4b5563;\n        margin-bottom: 1rem;\n      }\n      .card {\n        border: 1px solid #d8e2e8;\n        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);\n      }\n      .leaflet-container {\n        border-radius: 0.8rem;\n        border: 1px solid #d9e3e9;\n      }\n      .nav-pills .nav-link.active {\n        background-color: #1f6f5d;\n      }\n      .photo-grid {\n        display: grid;\n        grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));\n        gap: 0.75rem;\n        margin-top: 0.75rem;\n      }\n      .photo-item {\n        border: 1px solid #d8e2e8;\n        border-radius: 0.5rem;\n        background: #ffffff;\n        overflow: hidden;\n      }\n      .photo-item img {\n        width: 100%;\n        height: 110px;\n        object-fit: cover;\n      }\n      .photo-caption {\n        padding: 0.5rem;\n        font-size: 0.8rem;\n        color: #334155;\n        font-weight: 600;\n      }\n    "))
   ),
   navset_card_tab(
     nav_panel(
@@ -261,13 +261,17 @@ ui <- page_sidebar(
     ),
     
     nav_panel(
-      "litter/duff calculator",
+      "Photo Guide Calculator",
       layout_columns(
         col_widths = c(4, 8),
         card(
           full_screen = TRUE,
           card_header("Photo Guide Inputs"),
+          selectInput("elevation_filter", "Elevation", choices = c("Low", "Medium", "High"), selected = "Low"),
+          selectInput("aspect_filter", "Aspect", choices = c("46–135", "136–225", "226–315", "316–45"), selected = "46–135"),
+          selectInput("vegetation_filter", "Vegetation type", choices = sort(unique(photo_guide_options$vegetation_type))),
           selectInput("photo_option", "Photo guide option", choices = photo_guide_options$photo_id),
+          uiOutput("photo_gallery"),
           numericInput("litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
           numericInput("duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
           checkboxInput("use_custom_factors", "Use custom factors from your fuel guide", value = FALSE),
@@ -343,10 +347,56 @@ server <- function(input, output, session) {
     paste0(input$wind_speed, " m/s @ ", input$wind_direction, "°")
   })
   
-  selected_photo <- reactive({
+  filtered_photo_options <- reactive({
     photo_guide_options %>%
-      filter(photo_id == input$photo_option) %>%
-      slice(1)
+      filter(
+        elevation_band == input$elevation_filter,
+        aspect_band == input$aspect_filter,
+        vegetation_type == input$vegetation_filter
+      )
+  })
+  
+  observeEvent(filtered_photo_options(), {
+    filtered <- filtered_photo_options()
+    choices <- filtered$photo_id
+    
+    if (length(choices) == 0) {
+      updateSelectInput(session, "photo_option", choices = character(0), selected = character(0))
+    } else {
+      selected <- if (input$photo_option %in% choices) input$photo_option else choices[[1]]
+      updateSelectInput(session, "photo_option", choices = choices, selected = selected)
+    }
+  }, ignoreInit = FALSE)
+  
+  output$photo_gallery <- renderUI({
+    filtered <- filtered_photo_options() %>% slice_head(n = 5)
+    
+    if (nrow(filtered) == 0) {
+      return(tags$p("No photo options match the selected filters."))
+    }
+    
+    div(
+      class = "photo-grid",
+      lapply(seq_len(nrow(filtered)), function(i) {
+        div(
+          class = "photo-item",
+          tags$img(src = filtered$image_url[i], alt = paste("Photo guide", filtered$photo_id[i])),
+          div(class = "photo-caption", paste(filtered$photo_id[i], "-", filtered$site_type[i]))
+        )
+      })
+    )
+  })
+  
+  selected_photo <- reactive({
+    filtered <- filtered_photo_options()
+    req(nrow(filtered) > 0)
+    
+    selected <- filtered %>% filter(photo_id == input$photo_option) %>% slice(1)
+    if (nrow(selected) == 0) {
+      selected <- filtered %>% slice(1)
+    }
+    
+    selected
   })
   
   photo_calc <- reactive({
@@ -387,6 +437,9 @@ server <- function(input, output, session) {
       `Photo Option` = option$photo_id,
       `Site Type` = option$site_type,
       Ecozone = option$ecozone,
+      Elevation = option$elevation_band,
+      Aspect = option$aspect_band,
+      Vegetation = option$vegetation_type,
       `Litter factor (tons/acre/in)` = photo_calc()$litter_factor,
       `Duff factor (tons/acre/in)` = photo_calc()$duff_factor
     )

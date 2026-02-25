@@ -35,7 +35,11 @@ photo_guide_options <- tribble(
   "P03", "Pine-hardwood", "Piedmont", 1.61, 4.02,
   "P04", "Mesic hardwood", "Piedmont", 1.77, 3.38,
   "P05", "Oak-hickory", "Appalachian Foothills", 1.49, 3.82,
-  "P06", "Longleaf pine", "Sandhills", 1.30, 5.10
+  "P06", "Longleaf pine", "Sandhills", 1.30, 5.10,
+  "P07", "Dry mixed oak", "Ridge and Valley", 1.18, 3.10,
+  "P08", "Pine plantation", "Lower Coastal Plain", 1.42, 4.55,
+  "P09", "Moist bottomland", "Floodplain", 1.90, 2.75,
+  "P10", "Flatwoods pine", "Flatwoods", 1.24, 4.68
 )
 
 # Function to calculate dispersion coefficients
@@ -207,6 +211,7 @@ ui <- page_sidebar(
       ),
       selected = "D"
     ),
+    sliderInput("smoke_opacity", "Smoke layer transparency", min = 0.1, max = 0.7, value = 0.32, step = 0.02),
     
     br(),
     actionButton("predict", "Generate Smoke Prediction", class = "btn-primary btn-lg", style = "width: 100%;")
@@ -256,7 +261,7 @@ ui <- page_sidebar(
     ),
     
     nav_panel(
-      "litter/duff calculator",
+      "Photo Guide Calculator",
       layout_columns(
         col_widths = c(4, 8),
         card(
@@ -264,7 +269,13 @@ ui <- page_sidebar(
           card_header("Photo Guide Inputs"),
           selectInput("photo_option", "Photo guide option", choices = photo_guide_options$photo_id),
           numericInput("litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
-          numericInput("duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1)
+          numericInput("duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
+          checkboxInput("use_custom_factors", "Use custom factors from your fuel guide", value = FALSE),
+          conditionalPanel(
+            condition = "input.use_custom_factors == true",
+            numericInput("custom_litter_factor", "Custom litter factor (tons/acre/in)", value = 1.38, min = 0, max = 20, step = 0.01),
+            numericInput("custom_duff_factor", "Custom duff factor (tons/acre/in)", value = 4.84, min = 0, max = 20, step = 0.01)
+          )
         ),
         card(
           full_screen = TRUE,
@@ -342,14 +353,19 @@ server <- function(input, output, session) {
     option <- selected_photo()
     req(nrow(option) == 1)
     
-    litter_mass <- input$litter_depth * option$litter_factor
-    duff_mass <- input$duff_depth * option$duff_factor
+    litter_factor <- if (isTRUE(input$use_custom_factors)) input$custom_litter_factor else option$litter_factor
+    duff_factor <- if (isTRUE(input$use_custom_factors)) input$custom_duff_factor else option$duff_factor
+    
+    litter_mass <- input$litter_depth * litter_factor
+    duff_mass <- input$duff_depth * duff_factor
     
     list(
       litter_mass = litter_mass,
       duff_mass = duff_mass,
       total_mass = litter_mass + duff_mass,
-      option = option
+      option = option,
+      litter_factor = litter_factor,
+      duff_factor = duff_factor
     )
   })
   
@@ -371,8 +387,8 @@ server <- function(input, output, session) {
       `Photo Option` = option$photo_id,
       `Site Type` = option$site_type,
       Ecozone = option$ecozone,
-      `Litter factor (tons/acre/in)` = option$litter_factor,
-      `Duff factor (tons/acre/in)` = option$duff_factor
+      `Litter factor (tons/acre/in)` = photo_calc()$litter_factor,
+      `Duff factor (tons/acre/in)` = photo_calc()$duff_factor
     )
     
     datatable(table_data, options = list(dom = "t"), rownames = FALSE)
@@ -460,9 +476,10 @@ server <- function(input, output, session) {
           lng = ellipse_coords$lng,
           lat = ellipse_coords$lat,
           fillColor = pal(ellipse_data$aqi_bin[i]),
-          fillOpacity = 0.5,
-          color = "black",
-          weight = 1,
+          fillOpacity = input$smoke_opacity,
+          color = "#ffffff",
+          opacity = 0.35,
+          weight = 0.6,
           popup = paste("AQI Category:", ellipse_data$aqi_bin[i])
         )
     }

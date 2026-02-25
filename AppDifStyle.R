@@ -261,7 +261,7 @@ ui <- page_sidebar(
     ),
     
     nav_panel(
-      "Photo Guide Calculator",
+      "litter/duff calculator",
       layout_columns(
         col_widths = c(4, 8),
         card(

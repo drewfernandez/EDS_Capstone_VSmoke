@@ -1,17 +1,14 @@
 # Smoke Plume Prediction Studio + Photo Guide Calculator (FULL APP)
-# VSMOKE-CLOSER VERSION
 # ------------------------------------------------------------
-# Major changes:
-# - duration treated as active flaming duration estimate
-# - added fuel consumption fraction (% consumed)
-# - added ignition method (Backing/Spot vs Head/Aerial)
-# - replaced custom residual controls with VSMOKE-style plume rise fraction
-# - negative plume rise fraction curtains smoke from ground to plume-top
-# - reduced tendency to keep Hazardous / Very Unhealthy too far downwind
-# - uses raw concentration for AQI mapping (no broad severity smoothing)
-# - finer grid and small isolated-cell cleanup
+# Includes:
+# - Smoke plume map
+# - Manual Diff/Litter Calculator
+# - AI Photo Match Calculator (OpenAI-only matching)
+# - Map shows before Generate is clicked
+# - Click map to choose burn location
 #
-# install.packages(c("shiny","tidyverse","DT","bslib","leaflet","htmltools"))
+# Extra packages needed for AI photo matching:
+# install.packages(c("openai", "magick", "jsonlite", "base64enc"))
 
 library(shiny)
 library(tidyverse)
@@ -19,6 +16,280 @@ library(DT)
 library(bslib)
 library(leaflet)
 library(htmltools)
+
+# ---------------------------
+# OpenAI / image match helpers
+# ---------------------------
+
+Sys.setenv(OPENAI_API_KEY = "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")
+.assert_shiny_fix_dependencies <- function() {
+  pkgs <- c("openai", "magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc")
+  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) > 0) {
+    stop(paste("Missing required packages:", paste(missing, collapse = ", ")), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+extract_openai_content <- function(response) {
+  if (!is.null(response$choices) && length(response$choices) >= 1) {
+    first_choice <- response$choices[[1]]
+    
+    if (!is.null(first_choice$message) && !is.null(first_choice$message$content)) {
+      content <- first_choice$message$content
+      
+      if (is.character(content) && length(content) >= 1) {
+        text <- trimws(content[[1]])
+        if (nzchar(text)) return(text)
+      }
+      
+      if (is.list(content) && length(content) > 0) {
+        text_vals <- unlist(lapply(content, function(x) {
+          if (!is.null(x$text)) x$text else NULL
+        }))
+        text_vals <- trimws(text_vals)
+        text_vals <- text_vals[nzchar(text_vals)]
+        if (length(text_vals) > 0) return(paste(text_vals, collapse = "\n"))
+      }
+    }
+    
+    if (!is.null(first_choice$finish_reason) &&
+        first_choice$finish_reason %in% c("length", "content_filter")) {
+      return(sprintf(
+        "Model stopped with finish_reason='%s'. Try a shorter prompt or another model.",
+        first_choice$finish_reason
+      ))
+    }
+  }
+  
+  NULL
+}
+
+ask_openai_assistant <- function(prompt, top_matches, model = "gpt-4o-mini") {
+  .assert_shiny_fix_dependencies()
+  
+  api_key <- Sys.getenv("OPENAI_API_KEY", unset = "")
+  if (!nzchar(api_key)) {
+    return("OPENAI_API_KEY is not set.")
+  }
+  
+  match_lines <- top_matches |>
+    dplyr::mutate(summary = paste0(
+      photo_id, " | ", site_type, " | similarity=", round(similarity, 1), "%"
+    )) |>
+    dplyr::pull(summary)
+  
+  user_content <- paste(
+    "User request:", prompt,
+    "\nTop matched guide photos:\n", paste0("- ", match_lines, collapse = "\n"),
+    "\nGive a concise recommendation for which output photo to use and why."
+  )
+  
+  response <- tryCatch(
+    openai::create_chat_completion(
+      model = model,
+      temperature = 0.2,
+      max_tokens = 220,
+      messages = list(
+        list(
+          role = "system",
+          content = "You are a wildfire fuel photo assistant. Be brief, practical, and safety-minded."
+        ),
+        list(
+          role = "user",
+          content = user_content
+        )
+      )
+    ),
+    error = function(e) {
+      structure(list(.error = e$message), class = "openai_error_wrapper")
+    }
+  )
+  
+  if (!is.null(response$.error)) {
+    return(paste("OpenAI recommendation error:", response$.error))
+  }
+  
+  content <- tryCatch(extract_openai_content(response), error = function(e) NULL)
+  if (!is.null(content) && nzchar(trimws(content))) {
+    return(content)
+  }
+  
+  "OpenAI returned no recommendation text."
+}
+
+safe_img_vector <- function(path, size = 96) {
+  .assert_shiny_fix_dependencies()
+  
+  img <- magick::image_read(path) |>
+    magick::image_resize(sprintf("%dx%d!", size, size)) |>
+    magick::image_convert(colorspace = "Gray")
+  
+  as.numeric(magick::image_data(img, channels = "gray"))
+}
+
+# Local shortlist only; NOT used as final fallback
+find_candidate_matches_local <- function(upload_path, reference_df, top_n = 20) {
+  .assert_shiny_fix_dependencies()
+  
+  up_vec <- safe_img_vector(upload_path)
+  
+  reference_df |>
+    dplyr::filter(image_exists, !is.na(local_path), file.exists(local_path)) |>
+    dplyr::rowwise() |>
+    dplyr::mutate(
+      prefilter_distance = mean(abs(up_vec - safe_img_vector(local_path)))
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::arrange(prefilter_distance) |>
+    dplyr::slice_head(n = top_n)
+}
+
+find_top_matches_openai <- function(
+    upload_path,
+    reference_df,
+    model = "gpt-4o-mini",
+    top_n = 5,
+    candidate_limit = 20
+) {
+  .assert_shiny_fix_dependencies()
+  
+  api_key <- Sys.getenv("OPENAI_API_KEY", unset = "")
+  if (!nzchar(api_key)) {
+    stop("OPENAI_API_KEY is not set. Add it to .Renviron or call Sys.setenv() in your current R session.")
+  }
+  
+  local_candidates <- find_candidate_matches_local(
+    upload_path = upload_path,
+    reference_df = reference_df,
+    top_n = candidate_limit
+  )
+  
+  if (nrow(local_candidates) == 0) {
+    stop("No candidate guide photos were found.")
+  }
+  
+  uploaded_ext <- tolower(tools::file_ext(upload_path))
+  uploaded_mime <- ifelse(
+    uploaded_ext %in% c("jpg", "jpeg"), "image/jpeg",
+    ifelse(uploaded_ext == "webp", "image/webp", "image/png")
+  )
+  uploaded_uri <- base64enc::dataURI(file = upload_path, mime = uploaded_mime)
+  
+  results <- vector("list", nrow(local_candidates))
+  
+  for (i in seq_len(nrow(local_candidates))) {
+    cand <- local_candidates[i, ]
+    
+    results[[i]] <- tryCatch({
+      cand_path <- as.character(cand$local_path[[1]])
+      cand_id <- as.character(cand$photo_id[[1]])
+      
+      if (!file.exists(cand_path)) {
+        return(tibble::tibble(
+          photo_id = cand_id,
+          openai_similarity = NA_real_,
+          openai_reason = "Candidate image file does not exist"
+        ))
+      }
+      
+      cand_mime <- if (grepl("\\.jpe?g$", cand_path, ignore.case = TRUE)) {
+        "image/jpeg"
+      } else if (grepl("\\.webp$", cand_path, ignore.case = TRUE)) {
+        "image/webp"
+      } else {
+        "image/png"
+      }
+      
+      cand_uri <- base64enc::dataURI(file = cand_path, mime = cand_mime)
+      
+      compare_prompt <- paste(
+        "Compare these two forest-fuel photos.",
+        "Return ONLY valid JSON with keys:",
+        "similarity (0-100 number), reason (short string).",
+        "Score visual similarity of vegetation/fuel-bed structure, litter/duff appearance, and ground cover."
+      )
+      
+      resp <- tryCatch(
+        openai::create_chat_completion(
+          model = model,
+          temperature = 0,
+          max_tokens = 120,
+          messages = list(
+            list(
+              role = "user",
+              content = list(
+                list(type = "text", text = compare_prompt),
+                list(type = "text", text = "Image A (uploaded reference):"),
+                list(type = "image_url", image_url = list(url = uploaded_uri)),
+                list(type = "text", text = paste("Image B (guide", cand_id, "):")),
+                list(type = "image_url", image_url = list(url = cand_uri))
+              )
+            )
+          )
+        ),
+        error = function(e) structure(list(.error = e$message), class = "openai_error_wrapper")
+      )
+      
+      if (!is.null(resp$.error)) {
+        return(tibble::tibble(
+          photo_id = cand_id,
+          openai_similarity = NA_real_,
+          openai_reason = paste("OpenAI API error:", resp$.error)
+        ))
+      }
+      
+      txt <- extract_openai_content(resp)
+      parsed <- tryCatch(jsonlite::fromJSON(txt), error = function(e) NULL)
+      
+      if (is.null(parsed) || is.null(parsed$similarity)) {
+        tibble::tibble(
+          photo_id = cand_id,
+          openai_similarity = NA_real_,
+          openai_reason = paste("Invalid JSON returned:", txt)
+        )
+      } else {
+        tibble::tibble(
+          photo_id = cand_id,
+          openai_similarity = as.numeric(parsed$similarity),
+          openai_reason = as.character(if (!is.null(parsed$reason)) parsed$reason else "")
+        )
+      }
+    }, error = function(e) {
+      tibble::tibble(
+        photo_id = as.character(cand$photo_id[[1]]),
+        openai_similarity = NA_real_,
+        openai_reason = paste("Candidate", i, "failed:", e$message)
+      )
+    })
+  }
+  
+  scored <- dplyr::bind_rows(results)
+  
+  ranked <- local_candidates |>
+    dplyr::left_join(scored, by = "photo_id") |>
+    dplyr::filter(!is.na(openai_similarity)) |>
+    dplyr::mutate(
+      similarity = pmax(0, pmin(100, openai_similarity))
+    ) |>
+    dplyr::arrange(dplyr::desc(similarity)) |>
+    dplyr::slice_head(n = top_n)
+  
+  if (nrow(ranked) == 0) {
+    all_reasons <- scored |>
+      dplyr::filter(!is.na(openai_reason)) |>
+      dplyr::pull(openai_reason)
+    
+    stop(
+      paste(
+        "OpenAI did not return valid similarity scores.",
+        paste(all_reasons, collapse = " | ")
+      )
+    )
+  }
+  
+  ranked
+}
 
 # ---------------------------
 # Approximate VSMOKE-style dispersion parameters
@@ -33,7 +304,6 @@ vsmoke_dispersion_params <- list(
   "F" = list(Ay = 0.12, By = 0.020, Cz = 0.04, Dz = 0.74)
 )
 
-# Approximate PM2.5 emission factors in tons PM per ton fuel consumed
 fuel_emission_factors <- list(
   "Grass" = 0.013,
   "Shrub" = 0.016,
@@ -45,8 +315,6 @@ fuel_emission_factors <- list(
 
 # ---------------------------
 # Wind direction helper
-# Direction = where smoke travels TOWARD
-# 0 = East, 45 = Northeast, 90 = North, etc.
 # ---------------------------
 
 wind_dir_to_degrees <- function(direction_label) {
@@ -158,10 +426,6 @@ calc_concentration_vsmoke <- function(x_km, y_m, z_m, Q, u, H_eff,
   background + term1 * term2 * refl_sum
 }
 
-# VSMOKE-style plume rise fraction:
-# + value: lifted portion starts at plume-top
-# - value: lifted portion curtains from ground to plume-top
-# 0: all from ground
 calc_split_plume_conc_vsmoke <- function(x_km, y_m, z_m, Q, u, H_lofted,
                                          stability_class,
                                          plume_rise_fraction = -0.5,
@@ -326,9 +590,6 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
   total_pm_tonnes <- total_fuel_tonnes_consumed * emission_factor
   total_pm_g <- total_pm_tonnes * 1e6
   
-  # Periods closer to VSMOKE thinking:
-  # duration = active flaming duration estimate
-  # acres are effectively burned across that active period
   flaming_hours <- max(duration_hours * flaming_duration_fraction, 0.1)
   smolder_hours <- max(duration_hours - flaming_hours, 0.1)
   
@@ -344,7 +605,6 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
   heat_release_mw <- fuel_flaming_kg_s * heat_content_kj_kg * convective_fraction * heat_mult / 1000
   F <- calc_buoyancy_flux(heat_release_mw)
   
-  # Smolder period less lofted than flaming
   plume_rise_fraction_smolder <- if (plume_rise_fraction < 0) {
     plume_rise_fraction * 0.35
   } else {
@@ -513,13 +773,14 @@ build_photo_guide_options <- function() {
       litter_factor = round(0.80 + (photo_num %% 9) * 0.18, 2),
       duff_factor   = round(0.60 + (photo_num %% 11) * 0.33, 2),
       image_url = map2_chr(photo_num, elevation_band, photo_image_url),
-      image_exists = map_lgl(image_url, ~ !is.na(.x) && file.exists(file.path("www", .x)))
+      local_path = ifelse(is.na(image_url), NA_character_, file.path("www", image_url)),
+      image_exists = !is.na(local_path) & file.exists(local_path)
     ) %>%
     select(
       photo_id, photo_num, site_type, ecozone,
       elevation_band, aspect_band, vegetation_type,
       litter_factor, duff_factor,
-      image_url, image_exists
+      image_url, local_path, image_exists
     )
 }
 
@@ -743,6 +1004,68 @@ ui <- page_sidebar(
     ),
     
     nav_panel(
+      "AI Photo Match Calculator",
+      layout_columns(
+        col_widths = c(4, 8),
+        
+        card(
+          full_screen = TRUE,
+          card_header("Upload a Photo to Match"),
+          p(class = "calc-note", "Upload a forest fuel / litter photo. OpenAI will compare it to the guide photos in your www folder and return the closest match."),
+          
+          fileInput(
+            "ai_photo_upload",
+            "Upload photo",
+            accept = c(".png", ".jpg", ".jpeg", ".webp")
+          ),
+          
+          numericInput("ai_litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
+          numericInput("ai_duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
+          
+          actionButton(
+            "match_uploaded_photo",
+            "Find Closest Guide Photo",
+            class = "btn-primary",
+            style = "width: 100%;"
+          ),
+          
+          br(), br(),
+          textOutput("ai_match_status"),
+          uiOutput("uploaded_photo_preview")
+        ),
+        
+        card(
+          full_screen = TRUE,
+          card_header("Best Match Result"),
+          
+          value_box(
+            title = "Best Match",
+            value = textOutput("ai_best_match_text"),
+            theme = "primary"
+          ),
+          value_box(
+            title = "Similarity",
+            value = textOutput("ai_similarity_text"),
+            theme = "success"
+          ),
+          value_box(
+            title = "Estimated Litter + Duff",
+            value = textOutput("ai_total_mass_text"),
+            theme = "warning"
+          ),
+          
+          uiOutput("ai_best_match_view"),
+          br(),
+          h5("Recommendation"),
+          verbatimTextOutput("ai_recommendation"),
+          br(),
+          h5("Top Matches"),
+          DTOutput("ai_match_table")
+        )
+      )
+    ),
+    
+    nav_panel(
       "Model Information",
       h4("Model Information"),
       tags$div(
@@ -752,7 +1075,11 @@ ui <- page_sidebar(
           tags$li("Fuel consumed fraction is included."),
           tags$li("Plume rise fraction follows VSMOKE-style semantics."),
           tags$li("Negative plume rise fraction curtains smoke upward, which is typical for prescribed burns."),
-          tags$li("AQI mapping uses raw concentration instead of broad smoothing.")
+          tags$li("AQI mapping uses raw concentration instead of broad smoothing."),
+          tags$li("The map now appears immediately, even before you generate a prediction."),
+          tags$li("Clicking the map sets the burn location and updates the latitude/longitude inputs."),
+          tags$li("The AI Photo Match Calculator uses OpenAI-only final ranking and no local fallback."),
+          tags$li("The matching loop now catches per-candidate errors instead of dying at index 1.")
         ),
         tags$h5("Important note:"),
         tags$p("This is a closer screening depiction, not a regulatory or exact VSMOKE clone.")
@@ -769,15 +1096,46 @@ server <- function(input, output, session) {
   
   values <- reactiveValues(
     prediction_data = NULL,
-    burn_lat = NULL,
-    burn_lon = NULL,
-    status = "Ready to generate prediction"
+    burn_lat = 40.7128,
+    burn_lon = -74.0060,
+    status = "Map ready. Click the map or enter coordinates, then generate prediction."
+  )
+  
+  ai_match_values <- reactiveValues(
+    matches = NULL,
+    recommendation = NULL,
+    status = "Upload a photo, then click 'Find Closest Guide Photo'."
   )
   
   observe({
     if (input$ignition_method == "Backing/Spot" && isTRUE(all.equal(input$plume_rise_fraction, 0.75))) {
       updateSliderInput(session, "plume_rise_fraction", value = -0.5)
     }
+  })
+  
+  observeEvent(list(input$latitude, input$longitude), {
+    req(input$latitude, input$longitude)
+    values$burn_lat <- input$latitude
+    values$burn_lon <- input$longitude
+  }, ignoreInit = FALSE)
+  
+  observeEvent(input$smoke_map_click, {
+    click <- input$smoke_map_click
+    req(click$lat, click$lng)
+    
+    values$burn_lat <- click$lat
+    values$burn_lon <- click$lng
+    values$prediction_data <- NULL
+    
+    updateNumericInput(session, "latitude", value = round(click$lat, 6))
+    updateNumericInput(session, "longitude", value = round(click$lng, 6))
+    
+    values$status <- paste0(
+      "Burn location selected from map: ",
+      round(click$lat, 6), ", ",
+      round(click$lng, 6),
+      ". Press Generate Smoke Prediction to run the model."
+    )
   })
   
   output$status_text <- renderText(values$status)
@@ -909,6 +1267,188 @@ server <- function(input, output, session) {
     datatable(table_data, options = list(dom = "t"), rownames = FALSE)
   })
   
+  # ---------------------------
+  # AI photo match tab
+  # ---------------------------
+  
+  output$ai_match_status <- renderText({
+    ai_match_values$status
+  })
+  
+  output$uploaded_photo_preview <- renderUI({
+    req(input$ai_photo_upload)
+    
+    ext <- tolower(tools::file_ext(input$ai_photo_upload$name))
+    mime <- if (ext %in% c("jpg", "jpeg")) {
+      "image/jpeg"
+    } else if (ext == "webp") {
+      "image/webp"
+    } else {
+      "image/png"
+    }
+    
+    img_src <- base64enc::dataURI(file = input$ai_photo_upload$datapath, mime = mime)
+    
+    div(
+      class = "selected-photo-wrap",
+      tags$h5("Uploaded Photo"),
+      tags$img(
+        src = img_src,
+        style = "max-width:100%; border:1px solid #d8e2e8; border-radius:0.6rem;"
+      )
+    )
+  })
+  
+  observeEvent(input$match_uploaded_photo, {
+    req(input$ai_photo_upload)
+    
+    ref_df <- photo_guide_options %>%
+      filter(image_exists, !is.na(local_path), file.exists(local_path))
+    
+    validate(
+      need(nrow(ref_df) > 0, "No guide photos were found in the www folder."),
+      need(nzchar(Sys.getenv("OPENAI_API_KEY")), "OPENAI_API_KEY is not set.")
+    )
+    
+    ai_match_values$status <- "Matching uploaded image with OpenAI..."
+    ai_match_values$matches <- NULL
+    ai_match_values$recommendation <- NULL
+    
+    tryCatch({
+      matches <- find_top_matches_openai(
+        upload_path = input$ai_photo_upload$datapath,
+        reference_df = ref_df,
+        model = "gpt-4o-mini",
+        top_n = 5,
+        candidate_limit = 20
+      )
+      
+      if (is.null(matches) || nrow(matches) == 0) {
+        stop("OpenAI returned no matches.")
+      }
+      
+      ai_match_values$matches <- matches
+      
+      ai_match_values$recommendation <- ask_openai_assistant(
+        prompt = "Match this uploaded forest fuel photo to the closest guide photo and explain why.",
+        top_matches = matches,
+        model = "gpt-4o-mini"
+      )
+      
+      ai_match_values$status <- "OpenAI match complete."
+      
+    }, error = function(e) {
+      ai_match_values$matches <- NULL
+      ai_match_values$recommendation <- NULL
+      ai_match_values$status <- paste("OpenAI matching failed:", e$message)
+    })
+  })
+  
+  best_ai_match <- reactive({
+    req(ai_match_values$matches)
+    req(nrow(ai_match_values$matches) > 0)
+    ai_match_values$matches %>% slice(1)
+  })
+  
+  ai_photo_calc <- reactive({
+    best <- best_ai_match()
+    
+    litter_mass <- input$ai_litter_depth * best$litter_factor[[1]]
+    duff_mass   <- input$ai_duff_depth * best$duff_factor[[1]]
+    
+    list(
+      best = best,
+      litter_mass = litter_mass,
+      duff_mass = duff_mass,
+      total_mass = litter_mass + duff_mass
+    )
+  })
+  
+  output$ai_best_match_text <- renderText({
+    req(best_ai_match())
+    best <- best_ai_match()
+    paste(best$photo_id[[1]], "-", best$site_type[[1]])
+  })
+  
+  output$ai_similarity_text <- renderText({
+    req(best_ai_match())
+    best <- best_ai_match()
+    paste0(round(best$similarity[[1]], 1), "%")
+  })
+  
+  output$ai_total_mass_text <- renderText({
+    req(ai_photo_calc())
+    paste0(round(ai_photo_calc()$total_mass, 2), " tons/acre")
+  })
+  
+  output$ai_recommendation <- renderText({
+    req(ai_match_values$recommendation)
+    ai_match_values$recommendation
+  })
+  
+  output$ai_best_match_view <- renderUI({
+    req(best_ai_match())
+    best <- best_ai_match()
+    
+    if (is.na(best$image_url[[1]]) || !file.exists(best$local_path[[1]])) {
+      return(div(class = "warn-missing", "Matched image file not found in www/."))
+    }
+    
+    div(
+      class = "selected-photo-wrap",
+      tags$h5("Closest Guide Image"),
+      tags$img(src = best$image_url[[1]], alt = best$photo_id[[1]]),
+      br(),
+      tags$p(
+        tags$b("Photo ID: "), best$photo_id[[1]], tags$br(),
+        tags$b("Ecozone: "), best$ecozone[[1]], tags$br(),
+        tags$b("Vegetation: "), best$vegetation_type[[1]], tags$br(),
+        tags$b("Elevation: "), best$elevation_band[[1]], tags$br(),
+        tags$b("Aspect: "), best$aspect_band[[1]], tags$br(),
+        tags$b("Litter factor: "), best$litter_factor[[1]], tags$br(),
+        tags$b("Duff factor: "), best$duff_factor[[1]]
+      )
+    )
+  })
+  
+  output$ai_match_table <- renderDT({
+    req(ai_match_values$matches)
+    
+    table_data <- ai_match_values$matches %>%
+      mutate(
+        similarity = round(similarity, 1),
+        openai_similarity = round(openai_similarity, 1)
+      ) %>%
+      select(
+        photo_id, site_type, ecozone, vegetation_type,
+        elevation_band, aspect_band,
+        litter_factor, duff_factor,
+        similarity, openai_reason
+      ) %>%
+      rename(
+        `Photo ID` = photo_id,
+        `Site Type` = site_type,
+        `Ecozone` = ecozone,
+        `Vegetation` = vegetation_type,
+        `Elevation` = elevation_band,
+        `Aspect` = aspect_band,
+        `Litter Factor` = litter_factor,
+        `Duff Factor` = duff_factor,
+        `Similarity (%)` = similarity,
+        `OpenAI Reason` = openai_reason
+      )
+    
+    datatable(
+      table_data,
+      options = list(pageLength = 5, scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  # ---------------------------
+  # Smoke prediction generate
+  # ---------------------------
+  
   observeEvent(input$predict, {
     values$status <- "Generating smoke plume prediction..."
     
@@ -959,8 +1499,8 @@ server <- function(input, output, session) {
   })
   
   output$smoke_map <- renderLeaflet({
-    req(values$prediction_data)
-    
+    burn_lat <- values$burn_lat
+    burn_lon <- values$burn_lon
     df <- values$prediction_data
     
     aqi_levels <- c(
@@ -991,67 +1531,71 @@ server <- function(input, output, session) {
       ordered = TRUE
     )
     
-    map_df <- df %>%
-      filter(
-        x_rot > 0,
-        concentration >= threshold_min,
-        !is.na(aqi_bin)
-      ) %>%
-      mutate(
-        keep_cell = case_when(
-          concentration < 12.1 ~ TRUE,
-          neighbor_count >= 2 ~ TRUE,
-          x_rot <= 0.8 ~ TRUE,
-          TRUE ~ FALSE
-        )
-      ) %>%
-      filter(keep_cell) %>%
-      mutate(
-        aqi_bin = factor(aqi_bin, levels = aqi_levels, ordered = TRUE)
-      )
+    burn_radius_m <- sqrt(input$acres * 4046.86 / pi)
     
     m <- leaflet() %>%
       addProviderTiles(providers$Esri.WorldTopoMap)
     
-    if (nrow(map_df) > 0) {
-      for (i in seq_len(nrow(map_df))) {
-        m <- m %>%
-          addRectangles(
-            lng1 = map_df$lon_min[i],
-            lat1 = map_df$lat_min[i],
-            lng2 = map_df$lon_max[i],
-            lat2 = map_df$lat_max[i],
-            fillColor = pal(as.character(map_df$aqi_bin[i])),
-            fillOpacity = input$smoke_opacity,
-            color = NA,
-            stroke = FALSE,
-            popup = HTML(paste0(
-              "<b>AQI Category:</b> ", map_df$aqi_bin[i], "<br/>",
-              "<b>Concentration:</b> ", round(map_df$concentration[i], 2), " µg/m³<br/>",
-              "<b>Flaming contribution:</b> ", round(map_df$concentration_flaming[i], 2), " µg/m³<br/>",
-              "<b>Smolder contribution:</b> ", round(map_df$concentration_smolder[i], 2), " µg/m³<br/>",
-              "<b>Downwind distance:</b> ", round(map_df$x_rot[i], 2), " km<br/>",
-              "<b>Crosswind offset:</b> ", round(map_df$y_rot[i], 2), " km<br/>",
-              "<b>Plume top:</b> ", round(map_df$H_eff[i], 1), " m"
-            ))
+    map_df <- NULL
+    
+    if (!is.null(df)) {
+      map_df <- df %>%
+        filter(
+          x_rot > 0,
+          concentration >= threshold_min,
+          !is.na(aqi_bin)
+        ) %>%
+        mutate(
+          keep_cell = case_when(
+            concentration < 12.1 ~ TRUE,
+            neighbor_count >= 2 ~ TRUE,
+            x_rot <= 0.8 ~ TRUE,
+            TRUE ~ FALSE
           )
+        ) %>%
+        filter(keep_cell) %>%
+        mutate(
+          aqi_bin = factor(aqi_bin, levels = aqi_levels, ordered = TRUE)
+        )
+      
+      if (nrow(map_df) > 0) {
+        for (i in seq_len(nrow(map_df))) {
+          m <- m %>%
+            addRectangles(
+              lng1 = map_df$lon_min[i],
+              lat1 = map_df$lat_min[i],
+              lng2 = map_df$lon_max[i],
+              lat2 = map_df$lat_max[i],
+              fillColor = pal(as.character(map_df$aqi_bin[i])),
+              fillOpacity = input$smoke_opacity,
+              color = NA,
+              stroke = FALSE,
+              popup = HTML(paste0(
+                "<b>AQI Category:</b> ", map_df$aqi_bin[i], "<br/>",
+                "<b>Concentration:</b> ", round(map_df$concentration[i], 2), " µg/m³<br/>",
+                "<b>Flaming contribution:</b> ", round(map_df$concentration_flaming[i], 2), " µg/m³<br/>",
+                "<b>Smolder contribution:</b> ", round(map_df$concentration_smolder[i], 2), " µg/m³<br/>",
+                "<b>Downwind distance:</b> ", round(map_df$x_rot[i], 2), " km<br/>",
+                "<b>Crosswind offset:</b> ", round(map_df$y_rot[i], 2), " km<br/>",
+                "<b>Plume top:</b> ", round(map_df$H_eff[i], 1), " m"
+              ))
+            )
+        }
       }
     }
     
-    burn_radius_m <- sqrt(input$acres * 4046.86 / pi)
-    
     m <- m %>%
       addCircleMarkers(
-        lng = values$burn_lon,
-        lat = values$burn_lat,
+        lng = burn_lon,
+        lat = burn_lat,
         radius = 8,
         color = "red",
         fillOpacity = 1,
-        popup = "Burn location"
+        popup = "Burn location (click map to move)"
       ) %>%
       addCircles(
-        lng = values$burn_lon,
-        lat = values$burn_lat,
+        lng = burn_lon,
+        lat = burn_lat,
         radius = burn_radius_m,
         color = "orange",
         weight = 2,
@@ -1066,17 +1610,17 @@ server <- function(input, output, session) {
         opacity = 0.9
       )
     
-    if (nrow(map_df) > 0) {
+    if (!is.null(map_df) && nrow(map_df) > 0) {
       m <- m %>%
         fitBounds(
-          lng1 = min(c(values$burn_lon, map_df$lon_min), na.rm = TRUE),
-          lat1 = min(c(values$burn_lat, map_df$lat_min), na.rm = TRUE),
-          lng2 = max(c(values$burn_lon, map_df$lon_max), na.rm = TRUE),
-          lat2 = max(c(values$burn_lat, map_df$lat_max), na.rm = TRUE)
+          lng1 = min(c(burn_lon, map_df$lon_min), na.rm = TRUE),
+          lat1 = min(c(burn_lat, map_df$lat_min), na.rm = TRUE),
+          lng2 = max(c(burn_lon, map_df$lon_max), na.rm = TRUE),
+          lat2 = max(c(burn_lat, map_df$lat_max), na.rm = TRUE)
         )
     } else {
       m <- m %>%
-        setView(lng = values$burn_lon, lat = values$burn_lat, zoom = 10)
+        setView(lng = burn_lon, lat = burn_lat, zoom = 10)
     }
     
     m

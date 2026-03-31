@@ -12,7 +12,6 @@ library(base64enc)
 # OpenAI / image match helpers
 # ---------------------------
 
-Sys.setenv(OPENAI_API_KEY = "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")
 .assert_shiny_fix_dependencies <- function() {
   pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")
   missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]

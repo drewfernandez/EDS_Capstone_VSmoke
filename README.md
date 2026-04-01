@@ -62,12 +62,12 @@ This app gives prescribed fire planners and land managers a browser-based tool t
 
 | AQI Category | PM2.5 (µg/m³) |
 |---|---|
-| Good | 0 – 12 |
-| Moderate | 12 – 35.4 |
-| Unhealthy for Sensitive Groups | 35.4 – 55.4 |
-| Unhealthy | 55.4 – 150.4 |
-| Very Unhealthy | 150.4 – 250.4 |
-| Hazardous | 250.4+ |
+| Good | 0 – 50 |
+| Moderate | 51 – 100 |
+| Unhealthy for Sensitive Groups | 101 – 150 |
+| Unhealthy | 151 – 200 |
+| Very Unhealthy | 201 – 300 |
+| Hazardous | 301+ |
 
 ---
 

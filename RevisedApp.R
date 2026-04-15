@@ -14,7 +14,7 @@ library(rsconnect)
 # OpenAI / image match helpers
 # ---------------------------
 
-Sys.setenv(OPENAI_API_KEY = "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")
+Sys.setenv(OPENAI_API_KEY = "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")
 
 .assert_shiny_fix_dependencies <- function() {
   pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")
@@ -1071,7 +1071,8 @@ ui <- page_sidebar(
     checkboxInput("show_good", "Show low-concentration 'Good' smoke on map", value = FALSE),
     
     br(),
-    actionButton("predict", "Generate Smoke Prediction", class = "btn-primary btn-lg", style = "width: 100%;")
+    actionButton("predict", "Generate Smoke Prediction", class = "btn-primary btn-lg", style = "width: 100%;"),
+    uiOutput("prediction_loading_ui")
   ),
   
   tags$head(
@@ -1191,6 +1192,25 @@ ui <- page_sidebar(
         border:1px solid #d8e2e8;
         display:block;
         margin:auto;
+      }
+      .loading-indicator {
+        display:flex;
+        align-items:center;
+        gap:10px;
+        margin-top:12px;
+        padding:10px 12px;
+        border:1px solid #d8e2e8;
+        border-radius:12px;
+        background:#f8fbfc;
+        color:#334155;
+        font-weight:600;
+      }
+      .loading-gif {
+        width:36px;
+        height:36px;
+        object-fit:contain;
+        flex:0 0 auto;
+        display:block;
       }
     "))
   ),
@@ -1323,6 +1343,7 @@ ui <- page_sidebar(
             class = "btn-primary",
             style = "width: 100%;"
           ),
+          uiOutput("ai_loading_ui"),
           br(), br(),
           textOutput("ai_match_status"),
           uiOutput("uploaded_photo_preview")
@@ -1428,13 +1449,15 @@ server <- function(input, output, session) {
     prediction_data = NULL,
     burn_lat = 40.7128,
     burn_lon = -74.0060,
-    status = "Map ready. Click the map or enter coordinates, then generate prediction."
+    status = "Map ready. Click the map or enter coordinates, then generate prediction.",
+    is_generating = FALSE
   )
   
   ai_match_values <- reactiveValues(
     matches = NULL,
     recommendation = NULL,
-    status = "Upload a photo, then click 'Find Closest Guide Photo'."
+    status = "Upload a photo, then click 'Find Closest Guide Photo'.",
+    is_generating = FALSE
   )
   
   observe({
@@ -1470,6 +1493,22 @@ server <- function(input, output, session) {
   })
   
   output$status_text <- renderText(values$status)
+  output$prediction_loading_ui <- renderUI({
+    if (!isTRUE(values$is_generating)) return(NULL)
+    div(
+      class = "loading-indicator",
+      tags$img(src = "Loading Circle Animation.gif", class = "loading-gif", alt = "Loading"),
+      span("Generating smoke prediction...")
+    )
+  })
+  output$ai_loading_ui <- renderUI({
+    if (!isTRUE(ai_match_values$is_generating)) return(NULL)
+    div(
+      class = "loading-indicator",
+      tags$img(src = "Loading Circle Animation.gif", class = "loading-gif", alt = "Loading"),
+      span("Matching photo and building AI results...")
+    )
+  })
   output$selected_fuel_text <- renderText(
     paste(input$fuel_type, "|", round(effective_fuel_load(), 2), "tons/acre |", fuel_load_source_label(), "|", round(100 * input$consumed_fraction), "% consumed")
   )
@@ -1837,6 +1876,10 @@ server <- function(input, output, session) {
   
   observeEvent(input$match_uploaded_photo, {
     req(input$ai_photo_upload)
+    ai_match_values$is_generating <- TRUE
+    on.exit({
+      ai_match_values$is_generating <- FALSE
+    }, add = TRUE)
     
     ref_df <- photo_guide_options %>%
       filter(image_exists, !is.na(local_path), file.exists(local_path))
@@ -2099,6 +2142,10 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$predict, {
+    values$is_generating <- TRUE
+    on.exit({
+      values$is_generating <- FALSE
+    }, add = TRUE)
     values$status <- "Generating smoke plume prediction."
     
     req(

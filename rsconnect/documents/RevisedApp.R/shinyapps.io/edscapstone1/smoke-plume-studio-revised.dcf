@@ -1,0 +1,10 @@
+name: smoke-plume-studio-revised
+title:
+username: edscapstone1
+account: edscapstone1
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16764848
+bundleId: 11785140
+url: https://edscapstone1.shinyapps.io/smoke-plume-studio-revised/
+version: 1

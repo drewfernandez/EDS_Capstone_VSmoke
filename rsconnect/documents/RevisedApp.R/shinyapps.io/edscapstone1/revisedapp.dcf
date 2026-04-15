@@ -1,0 +1,12 @@
+name: revisedapp
+title:
+username: edscapstone1
+account: edscapstone1
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16764758
+bundleId: 11727218
+url: https://edscapstone1.shinyapps.io/revisedapp/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE

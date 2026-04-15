@@ -14,7 +14,7 @@ library(rsconnect)
 # OpenAI / image match helpers
 # ---------------------------
 
-Sys.setenv(OPENAI_API_KEY = "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")
+Sys.setenv(OPENAI_API_KEY = "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")
 
 .assert_shiny_fix_dependencies <- function() {
   pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")

@@ -17,6 +17,7 @@ This app gives prescribed fire planners and land managers a browser-based tool t
 - **Prediction data table** — full grid of predicted concentrations (µg/m³) color-coded by AQI severity band
 - **Duff/Litter fuel calculator** — estimates litter and duff fuel loading (tons/acre) from depth inputs using a photo guide keyed to elevation, aspect, and vegetation type
 - **Model information tab** — in-app documentation of model assumptions, parameters, and limitations
+- **AI Photo Match Calculator** - Uses OpenAI to compare the fuel guide photos to a photo of your choice and finds the closest match. 
 
 ---
 
@@ -58,6 +59,13 @@ This app gives prescribed fire planners and land managers a browser-based tool t
 4. Click **Generate Smoke Prediction** to run the model
 5. Explore results across the Map, Data, and Calculator tabs
 
+## How to use the AI Photo Match Calculator 
+1. Upload a photo of your choice that you want to analyze
+2. Input the litter and duff depth
+3. check the "show recommendation" box
+4. select "Find Closest Guide Photo"
+5. View the results on the right panel
+
 ### AQI Concentration Bands
 
 | AQI Category | PM2.5 (µg/m³) |
@@ -92,11 +100,11 @@ The app implements a steady-state Gaussian plume model consistent with VSmoke me
 
 ## Contributors
 
-| Name | GitHub |
-|---|---|
-| Keenan Pierce | [@keenanjp](https://github.com/keenanjp) |
-| Matteo Pivato | [@Mattewolf](https://github.com/Mattewolf) |
-| Drew Fernandez | [@drewfernandez](https://github.com/drewfernandez) |
+| Name | GitHub | Email |
+|---|---|---|
+| Keenan Pierce | [@keenanjp](https://github.com/keenanjp) | keenanjpierce@icloud.com |
+| Matteo Pivato | [@Mattewolf](https://github.com/Mattewolf) | Matteo@pivato.com |
+| Drew Fernandez | [@drewfernandez](https://github.com/drewfernandez) | drewfernandez254@gmail.com |
 
 
 
@@ -106,3 +114,9 @@ The app implements a steady-state Gaussian plume model consistent with VSmoke me
 
 - USDA Forest Service for the original VSmoke model and documentation
 - Course instructors and advisors for the EDS Capstone program at Virginia Tech.
+- Dr. Adam Coates Photo Guide for Estimating Fuel Loading in the Southern Appalachian Mountains
+
+---
+# Future Features 
+
+- Addition of a Topographic map and 3D model

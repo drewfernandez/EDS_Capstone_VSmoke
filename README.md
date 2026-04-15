@@ -100,11 +100,11 @@ The app implements a steady-state Gaussian plume model consistent with VSmoke me
 
 ## Contributors
 
-| Name | GitHub |
-|---|---|
-| Keenan Pierce | [@keenanjp](https://github.com/keenanjp) |
-| Matteo Pivato | [@Mattewolf](https://github.com/Mattewolf) |
-| Drew Fernandez | [@drewfernandez](https://github.com/drewfernandez) |
+| Name | GitHub | Email |
+|---|---|---|
+| Keenan Pierce | [@keenanjp](https://github.com/keenanjp) | keenanjpierce@icloud.com |
+| Matteo Pivato | [@Mattewolf](https://github.com/Mattewolf) | Matteo@pivato.com |
+| Drew Fernandez | [@drewfernandez](https://github.com/drewfernandez) | drewfernandez254@gmail.com |
 
 
 

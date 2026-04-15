@@ -1,29 +1,23 @@
-# Smoke Plume Prediction Studio + Photo Guide Calculator (FULL APP)
-# ------------------------------------------------------------
-# Includes:
-# - Smoke plume map
-# - Manual Diff/Litter Calculator
-# - AI Photo Match Calculator (OpenAI-only matching)
-# - Map shows before Generate is clicked
-# - Click map to choose burn location
-#
-# Extra packages needed for AI photo matching:
-# install.packages(c("openai", "magick", "jsonlite", "base64enc"))
-
 library(shiny)
 library(tidyverse)
 library(DT)
 library(bslib)
 library(leaflet)
 library(htmltools)
+library(httr2)
+library(jsonlite)
+library(base64enc)
+library(rsconnect)
+
 
 # ---------------------------
 # OpenAI / image match helpers
 # ---------------------------
 
-Sys.setenv(OPENAI_API_KEY = "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")
+Sys.setenv(OPENAI_API_KEY = "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")
+
 .assert_shiny_fix_dependencies <- function() {
-  pkgs <- c("openai", "magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc")
+  pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")
   missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing) > 0) {
     stop(paste("Missing required packages:", paste(missing, collapse = ", ")), call. = FALSE)
@@ -31,53 +25,74 @@ Sys.setenv(OPENAI_API_KEY = "sk-proj-NBenxuKFC8TFFTaZsBel0j2q2vIdVjy3z_FNRMVxMjK
   invisible(TRUE)
 }
 
-extract_openai_content <- function(response) {
-  if (!is.null(response$choices) && length(response$choices) >= 1) {
-    first_choice <- response$choices[[1]]
+retry_openai_request <- function(expr_fn, max_attempts = 4, base_sleep = 0.7) {
+  for (attempt in seq_len(max_attempts)) {
+    result <- tryCatch(expr_fn(), error = function(e) e)
     
-    if (!is.null(first_choice$message) && !is.null(first_choice$message$content)) {
-      content <- first_choice$message$content
-      
-      if (is.character(content) && length(content) >= 1) {
-        text <- trimws(content[[1]])
-        if (nzchar(text)) return(text)
-      }
-      
-      if (is.list(content) && length(content) > 0) {
-        text_vals <- unlist(lapply(content, function(x) {
-          if (!is.null(x$text)) x$text else NULL
-        }))
-        text_vals <- trimws(text_vals)
-        text_vals <- text_vals[nzchar(text_vals)]
-        if (length(text_vals) > 0) return(paste(text_vals, collapse = "\n"))
-      }
+    if (!inherits(result, "error")) {
+      return(result)
     }
     
-    if (!is.null(first_choice$finish_reason) &&
-        first_choice$finish_reason %in% c("length", "content_filter")) {
-      return(sprintf(
-        "Model stopped with finish_reason='%s'. Try a shorter prompt or another model.",
-        first_choice$finish_reason
-      ))
+    msg <- conditionMessage(result)
+    
+    if (!grepl("429|rate limit", msg, ignore.case = TRUE) || attempt == max_attempts) {
+      stop(result)
     }
+    
+    Sys.sleep(base_sleep * attempt)
   }
-  
-  NULL
 }
 
-ask_openai_assistant <- function(prompt, top_matches, model = "gpt-4o-mini") {
-  .assert_shiny_fix_dependencies()
-  
+extract_chat_text <- function(resp_json) {
+  if (!is.null(resp_json$choices) &&
+      length(resp_json$choices) >= 1 &&
+      !is.null(resp_json$choices[[1]]$message$content)) {
+    return(trimws(resp_json$choices[[1]]$message$content))
+  }
+  ""
+}
+
+openai_chat_raw <- function(model, messages, temperature = 0, max_completion_tokens = 120) {
   api_key <- Sys.getenv("OPENAI_API_KEY", unset = "")
   if (!nzchar(api_key)) {
-    return("OPENAI_API_KEY is not set.")
+    stop("OPENAI_API_KEY is not set.")
   }
   
-  match_lines <- top_matches |>
-    dplyr::mutate(summary = paste0(
-      photo_id, " | ", site_type, " | similarity=", round(similarity, 1), "%"
-    )) |>
-    dplyr::pull(summary)
+  body <- list(
+    model = model,
+    messages = messages,
+    temperature = temperature,
+    max_completion_tokens = max_completion_tokens
+  )
+  
+  retry_openai_request(function() {
+    resp <- httr2::request("https://api.openai.com/v1/chat/completions") |>
+      httr2::req_headers(
+        Authorization = paste("Bearer", api_key),
+        `Content-Type` = "application/json"
+      ) |>
+      httr2::req_body_json(body, auto_unbox = TRUE) |>
+      httr2::req_timeout(120) |>
+      httr2::req_perform()
+    
+    httr2::resp_body_json(resp, simplifyVector = FALSE)
+  })
+}
+
+ask_openai_assistant <- function(prompt, top_matches, model = "gpt-5.4-mini") {
+  top_matches <- normalize_ai_matches(top_matches)
+  if (nrow(top_matches) == 0) {
+    return("OpenAI recommendation error: no match results were available.")
+  }
+  
+  match_lines <- paste0(
+    top_matches$photo_id,
+    " | ",
+    top_matches$site_type,
+    " | similarity=",
+    ifelse(is.na(top_matches$similarity), "NA", sprintf("%.1f", top_matches$similarity)),
+    "%"
+  )
   
   user_content <- paste(
     "User request:", prompt,
@@ -86,10 +101,10 @@ ask_openai_assistant <- function(prompt, top_matches, model = "gpt-4o-mini") {
   )
   
   response <- tryCatch(
-    openai::create_chat_completion(
+    openai_chat_raw(
       model = model,
       temperature = 0.2,
-      max_tokens = 220,
+      max_completion_tokens = 120,
       messages = list(
         list(
           role = "system",
@@ -107,15 +122,159 @@ ask_openai_assistant <- function(prompt, top_matches, model = "gpt-4o-mini") {
   )
   
   if (!is.null(response$.error)) {
-    return(paste("OpenAI recommendation error:", response$.error))
+    err <- as.character(response$.error)
+    if (grepl("429|rate limit", err, ignore.case = TRUE)) {
+      return("Recommendation skipped because the OpenAI rate limit was reached. The top match results below are still usable.")
+    }
+    return(paste("OpenAI recommendation error:", err))
   }
   
-  content <- tryCatch(extract_openai_content(response), error = function(e) NULL)
-  if (!is.null(content) && nzchar(trimws(content))) {
-    return(content)
+  txt <- extract_chat_text(response)
+  if (nzchar(txt)) txt else "OpenAI returned no recommendation text."
+}
+
+safe_chr1 <- function(x, default = "") {
+  if (is.null(x) || length(x) == 0) return(default)
+  x <- as.character(x[[1]])
+  if (is.na(x) || !nzchar(x)) default else x
+}
+
+safe_num1 <- function(x, default = NA_real_) {
+  if (is.null(x) || length(x) == 0) return(default)
+  out <- suppressWarnings(as.numeric(x[[1]]))
+  if (length(out) == 0 || is.na(out)) default else out
+}
+
+coalesce_match_metadata <- function(matches_df, reference_df = photo_guide_options) {
+  if (is.null(matches_df) || !is.data.frame(matches_df) || nrow(matches_df) == 0) {
+    return(tibble::tibble())
   }
   
-  "OpenAI returned no recommendation text."
+  out <- tibble::as_tibble(matches_df)
+  ref <- tibble::as_tibble(reference_df)
+  
+  if (!"photo_id" %in% names(out) || !"photo_id" %in% names(ref)) {
+    return(out)
+  }
+  
+  ref_small <- ref %>%
+    dplyr::select(
+      photo_id, site_type, ecozone, vegetation_type,
+      elevation_band, aspect_band, litter_factor, duff_factor,
+      hr1, hr10, hr100,
+      litter_depth_ref, duff_depth_ref, fuel_height_ref,
+      fine_woody, coarse_woody, total_woody,
+      image_url, local_path, image_exists
+    )
+  
+  joined <- dplyr::left_join(out, ref_small, by = "photo_id", suffix = c("", ".ref"))
+  
+  pick_col <- function(df, primary, fallback = NULL, default = NULL) {
+    has_primary <- primary %in% names(df)
+    has_fallback <- !is.null(fallback) && fallback %in% names(df)
+    
+    if (has_primary && has_fallback) {
+      dplyr::coalesce(df[[primary]], df[[fallback]])
+    } else if (has_primary) {
+      df[[primary]]
+    } else if (has_fallback) {
+      df[[fallback]]
+    } else {
+      rep(default, nrow(df))
+    }
+  }
+  
+  joined %>%
+    dplyr::mutate(
+      site_type       = pick_col(., "site_type", "site_type.ref", "Guide photo"),
+      ecozone         = pick_col(., "ecozone", "ecozone.ref", NA_character_),
+      vegetation_type = pick_col(., "vegetation_type", "vegetation_type.ref", NA_character_),
+      elevation_band  = pick_col(., "elevation_band", "elevation_band.ref", NA_character_),
+      aspect_band     = pick_col(., "aspect_band", "aspect_band.ref", NA_character_),
+      litter_factor   = suppressWarnings(as.numeric(pick_col(., "litter_factor", "litter_factor.ref", NA_real_))),
+      duff_factor     = suppressWarnings(as.numeric(pick_col(., "duff_factor", "duff_factor.ref", NA_real_))),
+      hr1             = suppressWarnings(as.numeric(pick_col(., "hr1", "hr1.ref", NA_real_))),
+      hr10            = suppressWarnings(as.numeric(pick_col(., "hr10", "hr10.ref", NA_real_))),
+      hr100           = suppressWarnings(as.numeric(pick_col(., "hr100", "hr100.ref", NA_real_))),
+      litter_depth_ref = suppressWarnings(as.numeric(pick_col(., "litter_depth_ref", "litter_depth_ref.ref", NA_real_))),
+      duff_depth_ref   = suppressWarnings(as.numeric(pick_col(., "duff_depth_ref", "duff_depth_ref.ref", NA_real_))),
+      fuel_height_ref  = suppressWarnings(as.numeric(pick_col(., "fuel_height_ref", "fuel_height_ref.ref", NA_real_))),
+      fine_woody      = suppressWarnings(as.numeric(pick_col(., "fine_woody", "fine_woody.ref", NA_real_))),
+      coarse_woody    = suppressWarnings(as.numeric(pick_col(., "coarse_woody", "coarse_woody.ref", NA_real_))),
+      total_woody     = suppressWarnings(as.numeric(pick_col(., "total_woody", "total_woody.ref", NA_real_))),
+      image_url       = pick_col(., "image_url", "image_url.ref", NA_character_),
+      local_path      = pick_col(., "local_path", "local_path.ref", NA_character_),
+      image_exists    = pick_col(., "image_exists", "image_exists.ref", FALSE)
+    ) %>%
+    dplyr::select(-dplyr::any_of(c(
+      "site_type.ref", "ecozone.ref", "vegetation_type.ref",
+      "elevation_band.ref", "aspect_band.ref",
+      "litter_factor.ref", "duff_factor.ref",
+      "hr1.ref", "hr10.ref", "hr100.ref",
+      "litter_depth_ref.ref", "duff_depth_ref.ref", "fuel_height_ref.ref",
+      "fine_woody.ref", "coarse_woody.ref", "total_woody.ref",
+      "image_url.ref", "local_path.ref", "image_exists.ref"
+    )))
+}
+
+normalize_ai_matches <- function(df) {
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+    return(tibble::tibble())
+  }
+  
+  out <- tibble::as_tibble(df)
+  
+  if (!"photo_id" %in% names(out)) out$photo_id <- NA_character_
+  if (!"site_type" %in% names(out)) out$site_type <- "Guide photo"
+  if (!"ecozone" %in% names(out)) out$ecozone <- NA_character_
+  if (!"vegetation_type" %in% names(out)) out$vegetation_type <- NA_character_
+  if (!"elevation_band" %in% names(out)) out$elevation_band <- NA_character_
+  if (!"aspect_band" %in% names(out)) out$aspect_band <- NA_character_
+  if (!"litter_factor" %in% names(out)) out$litter_factor <- NA_real_
+  if (!"duff_factor" %in% names(out)) out$duff_factor <- NA_real_
+  if (!"hr1" %in% names(out)) out$hr1 <- NA_real_
+  if (!"hr10" %in% names(out)) out$hr10 <- NA_real_
+  if (!"hr100" %in% names(out)) out$hr100 <- NA_real_
+  if (!"litter_depth_ref" %in% names(out)) out$litter_depth_ref <- NA_real_
+  if (!"duff_depth_ref" %in% names(out)) out$duff_depth_ref <- NA_real_
+  if (!"fuel_height_ref" %in% names(out)) out$fuel_height_ref <- NA_real_
+  if (!"fine_woody" %in% names(out)) out$fine_woody <- NA_real_
+  if (!"coarse_woody" %in% names(out)) out$coarse_woody <- NA_real_
+  if (!"total_woody" %in% names(out)) out$total_woody <- NA_real_
+  if (!"image_url" %in% names(out)) out$image_url <- NA_character_
+  if (!"local_path" %in% names(out)) out$local_path <- NA_character_
+  if (!"openai_reason" %in% names(out)) out$openai_reason <- ""
+  
+  if ("similarity" %in% names(out)) {
+    out$similarity <- suppressWarnings(as.numeric(out$similarity))
+  } else if ("openai_similarity" %in% names(out)) {
+    out$similarity <- suppressWarnings(as.numeric(out$openai_similarity))
+  } else {
+    out$similarity <- NA_real_
+  }
+  
+  out$photo_id <- as.character(out$photo_id)
+  out$site_type <- ifelse(is.na(out$site_type) | !nzchar(as.character(out$site_type)), "Guide photo", as.character(out$site_type))
+  out$ecozone <- as.character(out$ecozone)
+  out$vegetation_type <- as.character(out$vegetation_type)
+  out$elevation_band <- as.character(out$elevation_band)
+  out$aspect_band <- as.character(out$aspect_band)
+  out$image_url <- as.character(out$image_url)
+  out$local_path <- as.character(out$local_path)
+  out$litter_factor <- suppressWarnings(as.numeric(out$litter_factor))
+  out$duff_factor <- suppressWarnings(as.numeric(out$duff_factor))
+  out$hr1 <- suppressWarnings(as.numeric(out$hr1))
+  out$hr10 <- suppressWarnings(as.numeric(out$hr10))
+  out$hr100 <- suppressWarnings(as.numeric(out$hr100))
+  out$litter_depth_ref <- suppressWarnings(as.numeric(out$litter_depth_ref))
+  out$duff_depth_ref <- suppressWarnings(as.numeric(out$duff_depth_ref))
+  out$fuel_height_ref <- suppressWarnings(as.numeric(out$fuel_height_ref))
+  out$fine_woody <- suppressWarnings(as.numeric(out$fine_woody))
+  out$coarse_woody <- suppressWarnings(as.numeric(out$coarse_woody))
+  out$total_woody <- suppressWarnings(as.numeric(out$total_woody))
+  out$openai_reason <- as.character(out$openai_reason)
+  
+  dplyr::arrange(out, dplyr::desc(similarity))
 }
 
 safe_img_vector <- function(path, size = 96) {
@@ -128,7 +287,6 @@ safe_img_vector <- function(path, size = 96) {
   as.numeric(magick::image_data(img, channels = "gray"))
 }
 
-# Local shortlist only; NOT used as final fallback
 find_candidate_matches_local <- function(upload_path, reference_df, top_n = 20) {
   .assert_shiny_fix_dependencies()
   
@@ -148,17 +306,10 @@ find_candidate_matches_local <- function(upload_path, reference_df, top_n = 20) 
 find_top_matches_openai <- function(
     upload_path,
     reference_df,
-    model = "gpt-4o-mini",
+    model = "gpt-5.4-mini",
     top_n = 5,
-    candidate_limit = 20
+    candidate_limit = 5
 ) {
-  .assert_shiny_fix_dependencies()
-  
-  api_key <- Sys.getenv("OPENAI_API_KEY", unset = "")
-  if (!nzchar(api_key)) {
-    stop("OPENAI_API_KEY is not set. Add it to .Renviron or call Sys.setenv() in your current R session.")
-  }
-  
   local_candidates <- find_candidate_matches_local(
     upload_path = upload_path,
     reference_df = reference_df,
@@ -211,10 +362,10 @@ find_top_matches_openai <- function(
       )
       
       resp <- tryCatch(
-        openai::create_chat_completion(
+        openai_chat_raw(
           model = model,
           temperature = 0,
-          max_tokens = 120,
+          max_completion_tokens = 80,
           messages = list(
             list(
               role = "user",
@@ -239,7 +390,7 @@ find_top_matches_openai <- function(
         ))
       }
       
-      txt <- extract_openai_content(resp)
+      txt <- extract_chat_text(resp)
       parsed <- tryCatch(jsonlite::fromJSON(txt), error = function(e) NULL)
       
       if (is.null(parsed) || is.null(parsed$similarity)) {
@@ -268,24 +419,16 @@ find_top_matches_openai <- function(
   
   ranked <- local_candidates |>
     dplyr::left_join(scored, by = "photo_id") |>
-    dplyr::filter(!is.na(openai_similarity)) |>
     dplyr::mutate(
+      openai_similarity = suppressWarnings(as.numeric(openai_similarity)),
       similarity = pmax(0, pmin(100, openai_similarity))
     ) |>
+    dplyr::filter(!is.na(openai_similarity)) |>
     dplyr::arrange(dplyr::desc(similarity)) |>
     dplyr::slice_head(n = top_n)
   
   if (nrow(ranked) == 0) {
-    all_reasons <- scored |>
-      dplyr::filter(!is.na(openai_reason)) |>
-      dplyr::pull(openai_reason)
-    
-    stop(
-      paste(
-        "OpenAI did not return valid similarity scores.",
-        paste(all_reasons, collapse = " | ")
-      )
-    )
+    stop("OpenAI did not return valid similarity scores.")
   }
   
   ranked
@@ -313,9 +456,8 @@ fuel_emission_factors <- list(
   "Heavy Fuels" = 0.022
 )
 
-# ---------------------------
-# Wind direction helper
-# ---------------------------
+LITTER_TONS_PER_ACRE_PER_INCH <- 1.38
+DUFF_TONS_PER_ACRE_PER_INCH <- 4.84
 
 wind_dir_to_degrees <- function(direction_label) {
   switch(
@@ -332,9 +474,13 @@ wind_dir_to_degrees <- function(direction_label) {
   )
 }
 
-# ---------------------------
-# Plume model helpers
-# ---------------------------
+fuel_moisture_profiles <- list(
+  "Very Dry" = list(consumption_mult = 1.15, flaming_mult = 1.12, plume_mult = 1.10),
+  "Dry" = list(consumption_mult = 1.08, flaming_mult = 1.05, plume_mult = 1.04),
+  "Moderate" = list(consumption_mult = 1.00, flaming_mult = 1.00, plume_mult = 1.00),
+  "Moist" = list(consumption_mult = 0.92, flaming_mult = 0.92, plume_mult = 0.95),
+  "Very Moist" = list(consumption_mult = 0.82, flaming_mult = 0.85, plume_mult = 0.90)
+)
 
 calc_buoyancy_flux <- function(heat_release_mw) {
   8.8 * max(heat_release_mw, 0)
@@ -552,10 +698,6 @@ count_neighbors <- function(df, threshold_col = "concentration", x_col = "x", y_
     select(-x_idx, -y_idx)
 }
 
-# ---------------------------
-# Main plume generator
-# ---------------------------
-
 generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, tons_per_acre,
                                  wind_speed = 5, wind_dir = 45, stability_class = "D",
                                  mixing_height = 1200,
@@ -569,19 +711,8 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
                                  plume_rise_fraction = -0.5,
                                  flaming_fraction = 0.65,
                                  flaming_duration_fraction = 0.30,
-                                 background_pm25 = 5) {
-  
-  validate(
-    need(acres > 0, "Acres must be greater than 0."),
-    need(duration_hours > 0, "Duration must be greater than 0."),
-    need(tons_per_acre > 0, "Fuel load must be greater than 0."),
-    need(wind_speed > 0, "Wind speed must be greater than 0."),
-    need(!is.null(fuel_emission_factors[[fuel_type]]), "Invalid fuel type.")
-  )
-  
-  consumed_fraction <- min(max(consumed_fraction, 0.05), 1.00)
-  flaming_fraction <- min(max(flaming_fraction, 0.10), 0.90)
-  flaming_duration_fraction <- min(max(flaming_duration_fraction, 0.10), 0.90)
+                                 background_pm25 = 5,
+                                 fuel_moisture = "Moderate") {
   
   total_fuel_tonnes_available <- acres * tons_per_acre * 0.907185
   total_fuel_tonnes_consumed <- total_fuel_tonnes_available * consumed_fraction
@@ -601,15 +732,14 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
   
   fuel_flaming_kg_s <- (total_fuel_tonnes_consumed * 1000 * flaming_fraction) / (flaming_hours * 3600)
   
+  moisture_profile <- fuel_moisture_profiles[[fuel_moisture]]
+  if (is.null(moisture_profile)) moisture_profile <- fuel_moisture_profiles[["Moderate"]]
+  
   heat_mult <- if (ignition_method == "Head/Aerial") 1.25 else 0.85
-  heat_release_mw <- fuel_flaming_kg_s * heat_content_kj_kg * convective_fraction * heat_mult / 1000
+  heat_release_mw <- fuel_flaming_kg_s * heat_content_kj_kg * convective_fraction * heat_mult * moisture_profile$plume_mult / 1000
   F <- calc_buoyancy_flux(heat_release_mw)
   
-  plume_rise_fraction_smolder <- if (plume_rise_fraction < 0) {
-    plume_rise_fraction * 0.35
-  } else {
-    plume_rise_fraction * 0.20
-  }
+  plume_rise_fraction_smolder <- if (plume_rise_fraction < 0) plume_rise_fraction * 0.35 else plume_rise_fraction * 0.20
   
   x_seq <- seq(-grid_size_km / 2, grid_size_km / 2, by = resolution_km)
   y_seq <- seq(-grid_size_km / 2, grid_size_km / 2, by = resolution_km)
@@ -631,9 +761,7 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
           mixing_height = mixing_height,
           ignition_method = ignition_method
         )
-      } else {
-        plume_base
-      },
+      } else plume_base,
       
       concentration_flaming = if (x_rot > 0) {
         calc_split_plume_conc_vsmoke(
@@ -651,9 +779,7 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
           sigma_y_min = 14,
           sigma_z_min = 6
         ) * 1e6
-      } else {
-        0
-      },
+      } else 0,
       
       concentration_smolder = if (x_rot > 0) {
         calc_split_plume_conc_vsmoke(
@@ -671,9 +797,7 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
           sigma_y_min = 18,
           sigma_z_min = 8
         ) * 1e6
-      } else {
-        0
-      }
+      } else 0
     ) %>%
     ungroup() %>%
     mutate(
@@ -708,7 +832,7 @@ generate_smoke_plume <- function(lat, lon, acres, duration_hours, fuel_type, ton
 }
 
 # ---------------------------
-# Photo Guide Mapping
+# Photo Guide Mapping (74 photos)
 # ---------------------------
 
 photo_nums_1000_1999 <- c(1:10, 22:27, 36:38, 57:60)
@@ -734,6 +858,83 @@ photo_image_url <- function(photo_num, elevation_band) {
   NA_character_
 }
 
+photo_guide_reference_data <- bind_rows(
+  tibble(photo_num = 1, ecozone = "Low elevation pine", aspect_degrees = 129.9, elevation_ft = 1552, slope_pct = 12.9, hr1 = 0.3, litter_depth_ref = 1.6, hr10 = 0.6, duff_depth_ref = 1.4, hr100 = 1.2, fuel_height_ref = 2.3, fine_woody = 2.1, coarse_woody = 1.0, shrub_cover_pct = 0.9, total_woody = 3.1, vegetation_lt1ft_pct = 25.0),
+  tibble(photo_num = 2, ecozone = "Low elevation pine", aspect_degrees = 96.0, elevation_ft = 1538, slope_pct = 10.8, hr1 = 0.2, litter_depth_ref = 2.0, hr10 = 0.4, duff_depth_ref = 1.0, hr100 = 1.2, fuel_height_ref = 2.5, fine_woody = 1.8, coarse_woody = 2.5, shrub_cover_pct = 3.4, total_woody = 4.3, vegetation_lt1ft_pct = 63.0),
+  tibble(photo_num = 3, ecozone = "Low elevation pine", aspect_degrees = 79.6, elevation_ft = 1582, slope_pct = 5.1, hr1 = 0.5, litter_depth_ref = 1.4, hr10 = 1.9, duff_depth_ref = 1.9, hr100 = 0.6, fuel_height_ref = 2.3, fine_woody = 3.0, coarse_woody = 5.3, shrub_cover_pct = 25.1, total_woody = 8.3, vegetation_lt1ft_pct = 10.0),
+  tibble(photo_num = 4, ecozone = "Acidic cove", aspect_degrees = 47.1, elevation_ft = 1209, slope_pct = 32.5, hr1 = 0.7, litter_depth_ref = 1.2, hr10 = 1.6, duff_depth_ref = 1.0, hr100 = 0.7, fuel_height_ref = 3.9, fine_woody = 3.0, coarse_woody = 2.5, shrub_cover_pct = 0.0, total_woody = 5.5, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 5, ecozone = "Dry mesic oak", aspect_degrees = 55.0, elevation_ft = 1457, slope_pct = 21.9, hr1 = 0.2, litter_depth_ref = 1.8, hr10 = 1.1, duff_depth_ref = 0.8, hr100 = 1.8, fuel_height_ref = 2.3, fine_woody = 3.1, coarse_woody = 2.6, shrub_cover_pct = 0.0, total_woody = 5.7, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 6, ecozone = "Low elevation pine", aspect_degrees = 133.6, elevation_ft = 1600, slope_pct = 15.2, hr1 = 0.1, litter_depth_ref = 1.3, hr10 = 0.6, duff_depth_ref = 0.7, hr100 = 2.9, fuel_height_ref = 2.4, fine_woody = 3.6, coarse_woody = 4.9, shrub_cover_pct = 16.0, total_woody = 8.5, vegetation_lt1ft_pct = 8.0),
+  tibble(photo_num = 7, ecozone = "Low elevation pine", aspect_degrees = 127.0, elevation_ft = 1219, slope_pct = 8.7, hr1 = 0.2, litter_depth_ref = 1.4, hr10 = 0.9, duff_depth_ref = 1.1, hr100 = 4.1, fuel_height_ref = 2.3, fine_woody = 5.2, coarse_woody = 1.0, shrub_cover_pct = 0.3, total_woody = 6.2, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 8, ecozone = "Montane oak-hickory cove", aspect_degrees = 117.3, elevation_ft = 1154, slope_pct = 4.5, hr1 = 0.4, litter_depth_ref = 1.0, hr10 = 1.5, duff_depth_ref = 1.7, hr100 = 2.9, fuel_height_ref = 4.5, fine_woody = 4.8, coarse_woody = 13.4, shrub_cover_pct = 9.4, total_woody = 18.2, vegetation_lt1ft_pct = 11.0),
+  tibble(photo_num = 9, ecozone = "Dry oak evergreen heath", aspect_degrees = 73.6, elevation_ft = 1408, slope_pct = 14.3, hr1 = 0.2, litter_depth_ref = 1.5, hr10 = 0.9, duff_depth_ref = 1.1, hr100 = 3.5, fuel_height_ref = 1.9, fine_woody = 4.6, coarse_woody = 0.9, shrub_cover_pct = 0.0, total_woody = 5.5, vegetation_lt1ft_pct = 95.0),
+  tibble(photo_num = 10, ecozone = "Acidic cove", aspect_degrees = 101.0, elevation_ft = 1219, slope_pct = 23.1, hr1 = 0.6, litter_depth_ref = 1.0, hr10 = 0.7, duff_depth_ref = 0.4, hr100 = 4.9, fuel_height_ref = 3.3, fine_woody = 6.2, coarse_woody = 0.3, shrub_cover_pct = 0.0, total_woody = 6.5, vegetation_lt1ft_pct = 4.5),
+  tibble(photo_num = 11, ecozone = "Low elevation pine", aspect_degrees = 90.9, elevation_ft = 2677, slope_pct = 13.5, hr1 = 0.3, litter_depth_ref = 1.2, hr10 = 1.0, duff_depth_ref = 0.8, hr100 = 0.0, fuel_height_ref = 1.2, fine_woody = 1.3, coarse_woody = 0.8, shrub_cover_pct = 52.7, total_woody = 2.1, vegetation_lt1ft_pct = 1.0),
+  tibble(photo_num = 12, ecozone = "Dry mesic oak", aspect_degrees = 47.5, elevation_ft = 2698, slope_pct = 25.2, hr1 = 0.2, litter_depth_ref = 1.1, hr10 = 0.4, duff_depth_ref = 1.5, hr100 = 0.6, fuel_height_ref = 1.6, fine_woody = 1.2, coarse_woody = 10.7, shrub_cover_pct = 57.6, total_woody = 11.9, vegetation_lt1ft_pct = 43.0),
+  tibble(photo_num = 13, ecozone = "Pine-oak heath", aspect_degrees = 85.5, elevation_ft = 2027, slope_pct = 28.6, hr1 = 0.5, litter_depth_ref = 2.0, hr10 = 0.6, duff_depth_ref = 1.9, hr100 = 0.6, fuel_height_ref = 3.4, fine_woody = 1.7, coarse_woody = 7.4, shrub_cover_pct = 0.0, total_woody = 9.1, vegetation_lt1ft_pct = 62.5),
+  tibble(photo_num = 14, ecozone = "Low elevation pine", aspect_degrees = 114.4, elevation_ft = 2675, slope_pct = 11.2, hr1 = 0.2, litter_depth_ref = 1.7, hr10 = 0.9, duff_depth_ref = 1.3, hr100 = 1.2, fuel_height_ref = 5.3, fine_woody = 2.3, coarse_woody = 1.1, shrub_cover_pct = 15.2, total_woody = 3.4, vegetation_lt1ft_pct = 35.0),
+  tibble(photo_num = 15, ecozone = "Low elevation pine", aspect_degrees = 109.9, elevation_ft = 2692, slope_pct = 16.4, hr1 = 0.3, litter_depth_ref = 1.6, hr10 = 0.6, duff_depth_ref = 1.6, hr100 = 2.3, fuel_height_ref = 7.5, fine_woody = 3.2, coarse_woody = 15.9, shrub_cover_pct = 0.0, total_woody = 19.1, vegetation_lt1ft_pct = 75.0),
+  tibble(photo_num = 16, ecozone = "Low elevation pine", aspect_degrees = 50.0, elevation_ft = 2463, slope_pct = 13.1, hr1 = 0.3, litter_depth_ref = 2.0, hr10 = 0.9, duff_depth_ref = 2.1, hr100 = 3.5, fuel_height_ref = 6.1, fine_woody = 4.7, coarse_woody = 1.5, shrub_cover_pct = 1.3, total_woody = 6.2, vegetation_lt1ft_pct = 27.0),
+  tibble(photo_num = 17, ecozone = "Dry mesic oak", aspect_degrees = 125.1, elevation_ft = 2581, slope_pct = 18.8, hr1 = 0.4, litter_depth_ref = 1.8, hr10 = 2.7, duff_depth_ref = 0.7, hr100 = 7.0, fuel_height_ref = 2.6, fine_woody = 10.1, coarse_woody = 8.1, shrub_cover_pct = 0.0, total_woody = 18.2, vegetation_lt1ft_pct = 2.0),
+  tibble(photo_num = 18, ecozone = "High elevation red oak", aspect_degrees = 80.4, elevation_ft = 5009, slope_pct = 27.9, hr1 = 0.2, litter_depth_ref = 3.0, hr10 = 1.6, duff_depth_ref = 2.4, hr100 = 0.0, fuel_height_ref = 3.2, fine_woody = 1.8, coarse_woody = 14.5, shrub_cover_pct = 0.0, total_woody = 16.3, vegetation_lt1ft_pct = 1.0),
+  tibble(photo_num = 19, ecozone = "Acidic cove", aspect_degrees = 108.5, elevation_ft = 3727, slope_pct = 21.9, hr1 = 0.5, litter_depth_ref = 1.3, hr10 = 0.4, duff_depth_ref = 2.0, hr100 = 0.6, fuel_height_ref = 4.1, fine_woody = 1.5, coarse_woody = 2.1, shrub_cover_pct = 84.3, total_woody = 3.6, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 20, ecozone = "Northern hardwood cove", aspect_degrees = 81.6, elevation_ft = 4049, slope_pct = 17.9, hr1 = 0.1, litter_depth_ref = 1.5, hr10 = 0.9, duff_depth_ref = 2.3, hr100 = 2.3, fuel_height_ref = 4.3, fine_woody = 3.3, coarse_woody = 12.7, shrub_cover_pct = 0.0, total_woody = 16.0, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 21, ecozone = "Acidic cove", aspect_degrees = 64.2, elevation_ft = 3580, slope_pct = 6.8, hr1 = 0.5, litter_depth_ref = 1.9, hr10 = 1.3, duff_depth_ref = 3.7, hr100 = 1.8, fuel_height_ref = 8.3, fine_woody = 3.6, coarse_woody = 0.0, shrub_cover_pct = 43.2, total_woody = 3.6, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 22, ecozone = "Acidic cove", aspect_degrees = 147.7, elevation_ft = 1086, slope_pct = 9.8, hr1 = 0.2, litter_depth_ref = 2.1, hr10 = 0.0, duff_depth_ref = 1.5, hr100 = 0.6, fuel_height_ref = 9.8, fine_woody = 0.8, coarse_woody = 1.1, shrub_cover_pct = 0.0, total_woody = 1.9, vegetation_lt1ft_pct = 1.5),
+  tibble(photo_num = 23, ecozone = "Dry oak evergreen heath", aspect_degrees = 197.2, elevation_ft = 1856, slope_pct = 23.1, hr1 = 0.4, litter_depth_ref = 1.5, hr10 = 0.9, duff_depth_ref = 2.0, hr100 = 1.2, fuel_height_ref = 5.7, fine_woody = 2.5, coarse_woody = 21.3, shrub_cover_pct = 9.2, total_woody = 23.8, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 24, ecozone = "Low elevation pine", aspect_degrees = 140.0, elevation_ft = 1577, slope_pct = 6.6, hr1 = 0.4, litter_depth_ref = 0.6, hr10 = 1.5, duff_depth_ref = 0.3, hr100 = 0.6, fuel_height_ref = 1.0, fine_woody = 2.5, coarse_woody = 1.6, shrub_cover_pct = 0.0, total_woody = 4.1, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 25, ecozone = "Dry oak evergreen heath", aspect_degrees = 196.6, elevation_ft = 1416, slope_pct = 18.8, hr1 = 0.2, litter_depth_ref = 1.6, hr10 = 0.6, duff_depth_ref = 2.1, hr100 = 2.3, fuel_height_ref = 3.4, fine_woody = 3.1, coarse_woody = 7.6, shrub_cover_pct = 74.6, total_woody = 10.7, vegetation_lt1ft_pct = 2.0),
+  tibble(photo_num = 26, ecozone = "Low elevation pine", aspect_degrees = 196.7, elevation_ft = 1541, slope_pct = 8.6, hr1 = 0.2, litter_depth_ref = 1.6, hr10 = 1.2, duff_depth_ref = 1.8, hr100 = 2.3, fuel_height_ref = 3.8, fine_woody = 3.7, coarse_woody = 0.0, shrub_cover_pct = 14.7, total_woody = 3.7, vegetation_lt1ft_pct = 10.0),
+  tibble(photo_num = 27, ecozone = "Dry mesic oak", aspect_degrees = 185.9, elevation_ft = 1171, slope_pct = 24.0, hr1 = 0.3, litter_depth_ref = 0.7, hr10 = 1.4, duff_depth_ref = 0.7, hr100 = 4.7, fuel_height_ref = 2.2, fine_woody = 6.4, coarse_woody = 0.8, shrub_cover_pct = 0.0, total_woody = 7.2, vegetation_lt1ft_pct = 7.0),
+  tibble(photo_num = 28, ecozone = "Low elevation pine", aspect_degrees = 183.8, elevation_ft = 2564, slope_pct = 4.1, hr1 = 0.2, litter_depth_ref = 1.2, hr10 = 0.4, duff_depth_ref = 1.1, hr100 = 0.0, fuel_height_ref = 1.7, fine_woody = 0.6, coarse_woody = 0.2, shrub_cover_pct = 0.0, total_woody = 0.8, vegetation_lt1ft_pct = 20.0),
+  tibble(photo_num = 29, ecozone = "Dry oak evergreen heath", aspect_degrees = 220.4, elevation_ft = 2662, slope_pct = 14.4, hr1 = 0.3, litter_depth_ref = 2.1, hr10 = 0.6, duff_depth_ref = 1.3, hr100 = 0.0, fuel_height_ref = 5.4, fine_woody = 0.9, coarse_woody = 16.2, shrub_cover_pct = 0.0, total_woody = 17.1, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 30, ecozone = "Low elevation pine", aspect_degrees = 209.7, elevation_ft = 2457, slope_pct = 13.7, hr1 = 0.2, litter_depth_ref = 0.9, hr10 = 0.6, duff_depth_ref = 1.4, hr100 = 1.2, fuel_height_ref = 2.3, fine_woody = 2.0, coarse_woody = 0.5, shrub_cover_pct = 29.0, total_woody = 2.5, vegetation_lt1ft_pct = 2.0),
+  tibble(photo_num = 31, ecozone = "Acidic cove", aspect_degrees = 225.1, elevation_ft = 3490, slope_pct = 1.9, hr1 = 0.3, litter_depth_ref = 2.1, hr10 = 0.9, duff_depth_ref = 3.1, hr100 = 1.8, fuel_height_ref = 5.6, fine_woody = 3.0, coarse_woody = 2.1, shrub_cover_pct = 39.3, total_woody = 5.1, vegetation_lt1ft_pct = 3.0),
+  tibble(photo_num = 32, ecozone = "Montane oak-hickory slope", aspect_degrees = 220.5, elevation_ft = 3705, slope_pct = 24.9, hr1 = 0.4, litter_depth_ref = 1.7, hr10 = 1.5, duff_depth_ref = 0.5, hr100 = 0.7, fuel_height_ref = 4.8, fine_woody = 2.6, coarse_woody = 4.3, shrub_cover_pct = 0.0, total_woody = 6.9, vegetation_lt1ft_pct = 27.0),
+  tibble(photo_num = 33, ecozone = "Acidic cove", aspect_degrees = 216.7, elevation_ft = 3529, slope_pct = 17.7, hr1 = 0.1, litter_depth_ref = 1.3, hr10 = 0.1, duff_depth_ref = 1.1, hr100 = 1.8, fuel_height_ref = 1.3, fine_woody = 2.0, coarse_woody = 7.2, shrub_cover_pct = 63.3, total_woody = 9.2, vegetation_lt1ft_pct = 1.0),
+  tibble(photo_num = 34, ecozone = "Acidic cove", aspect_degrees = 225.3, elevation_ft = 3742, slope_pct = 23.3, hr1 = 0.4, litter_depth_ref = 1.9, hr10 = 1.9, duff_depth_ref = 1.1, hr100 = 1.8, fuel_height_ref = 5.0, fine_woody = 4.1, coarse_woody = 1.9, shrub_cover_pct = 0.0, total_woody = 6.0, vegetation_lt1ft_pct = 19.0),
+  tibble(photo_num = 35, ecozone = "Dry oak evergreen heath", aspect_degrees = 196.6, elevation_ft = 4194, slope_pct = 27.9, hr1 = 0.3, litter_depth_ref = 2.4, hr10 = 0.9, duff_depth_ref = 1.2, hr100 = 3.1, fuel_height_ref = 4.9, fine_woody = 4.3, coarse_woody = 17.6, shrub_cover_pct = 0.0, total_woody = 21.9, vegetation_lt1ft_pct = 3.0),
+  tibble(photo_num = 36, ecozone = "Low elevation pine", aspect_degrees = 294.2, elevation_ft = 1050, slope_pct = 12.3, hr1 = 0.2, litter_depth_ref = 1.8, hr10 = 0.7, duff_depth_ref = 0.9, hr100 = 0.0, fuel_height_ref = 2.0, fine_woody = 0.9, coarse_woody = 1.4, shrub_cover_pct = 7.9, total_woody = 2.3, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 37, ecozone = "Dry mesic oak", aspect_degrees = 245.4, elevation_ft = 1467, slope_pct = 7.8, hr1 = 0.5, litter_depth_ref = 1.4, hr10 = 1.0, duff_depth_ref = 1.2, hr100 = 0.0, fuel_height_ref = 6.8, fine_woody = 1.5, coarse_woody = 0.0, shrub_cover_pct = 3.7, total_woody = 1.5, vegetation_lt1ft_pct = 72.0),
+  tibble(photo_num = 38, ecozone = "Dry mesic oak", aspect_degrees = 245.4, elevation_ft = 1426, slope_pct = 7.8, hr1 = 0.2, litter_depth_ref = 1.4, hr10 = 0.6, duff_depth_ref = 0.5, hr100 = 2.9, fuel_height_ref = 1.9, fine_woody = 3.7, coarse_woody = 1.1, shrub_cover_pct = 28.8, total_woody = 4.8, vegetation_lt1ft_pct = 51.0),
+  tibble(photo_num = 39, ecozone = "Low elevation pine", aspect_degrees = 243.5, elevation_ft = 3411, slope_pct = 9.4, hr1 = 0.2, litter_depth_ref = 1.4, hr10 = 0.3, duff_depth_ref = 1.0, hr100 = 0.0, fuel_height_ref = 3.2, fine_woody = 0.5, coarse_woody = 6.7, shrub_cover_pct = 30.5, total_woody = 7.2, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 40, ecozone = "Rich cove", aspect_degrees = 242.3, elevation_ft = 3435, slope_pct = 18.9, hr1 = 0.2, litter_depth_ref = 1.4, hr10 = 0.0, duff_depth_ref = 1.7, hr100 = 1.2, fuel_height_ref = 5.4, fine_woody = 1.4, coarse_woody = 25.9, shrub_cover_pct = 44.6, total_woody = 27.3, vegetation_lt1ft_pct = 4.0),
+  tibble(photo_num = 41, ecozone = "Dry mesic oak", aspect_degrees = 280.7, elevation_ft = 3395, slope_pct = 13.8, hr1 = 0.2, litter_depth_ref = 1.0, hr10 = 1.6, duff_depth_ref = 0.7, hr100 = 0.6, fuel_height_ref = 4.2, fine_woody = 2.4, coarse_woody = 8.1, shrub_cover_pct = 2.0, total_woody = 10.5, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 42, ecozone = "Montane oak-hickory slope", aspect_degrees = 242.9, elevation_ft = 2200, slope_pct = 32.7, hr1 = 0.2, litter_depth_ref = 1.4, hr10 = 0.3, duff_depth_ref = 1.5, hr100 = 1.2, fuel_height_ref = 4.7, fine_woody = 1.7, coarse_woody = 25.7, shrub_cover_pct = 44.5, total_woody = 27.4, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 43, ecozone = "Dry mesic oak", aspect_degrees = 253.5, elevation_ft = 2142, slope_pct = 13.2, hr1 = 0.3, litter_depth_ref = 0.9, hr10 = 0.7, duff_depth_ref = 2.9, hr100 = 1.2, fuel_height_ref = 3.4, fine_woody = 2.2, coarse_woody = 0.4, shrub_cover_pct = 70.4, total_woody = 2.6, vegetation_lt1ft_pct = 1.0),
+  tibble(photo_num = 44, ecozone = "Dry mesic oak", aspect_degrees = 230.7, elevation_ft = 3065, slope_pct = 19.2, hr1 = 0.3, litter_depth_ref = 1.6, hr10 = 0.7, duff_depth_ref = 0.6, hr100 = 1.8, fuel_height_ref = 3.9, fine_woody = 2.8, coarse_woody = 0.9, shrub_cover_pct = 0.0, total_woody = 3.7, vegetation_lt1ft_pct = 77.0),
+  tibble(photo_num = 45, ecozone = "Low elevation pine", aspect_degrees = 278.1, elevation_ft = 3459, slope_pct = 32.2, hr1 = 0.3, litter_depth_ref = 3.3, hr10 = 0.4, duff_depth_ref = 4.8, hr100 = 2.3, fuel_height_ref = 4.7, fine_woody = 3.0, coarse_woody = 3.6, shrub_cover_pct = 68.4, total_woody = 6.6, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 46, ecozone = "Acidic cove", aspect_degrees = 249.5, elevation_ft = 3491, slope_pct = 21.2, hr1 = 0.2, litter_depth_ref = 1.5, hr10 = 0.5, duff_depth_ref = 1.7, hr100 = 3.0, fuel_height_ref = 2.2, fine_woody = 3.7, coarse_woody = 4.3, shrub_cover_pct = 0.0, total_woody = 8.0, vegetation_lt1ft_pct = 4.0),
+  tibble(photo_num = 47, ecozone = "Montane oak-hickory slope", aspect_degrees = 272.5, elevation_ft = 4152, slope_pct = 23.5, hr1 = 0.2, litter_depth_ref = 2.2, hr10 = 0.4, duff_depth_ref = 0.6, hr100 = 0.0, fuel_height_ref = 3.1, fine_woody = 0.6, coarse_woody = 1.2, shrub_cover_pct = 0.0, total_woody = 1.8, vegetation_lt1ft_pct = 1.0),
+  tibble(photo_num = 48, ecozone = "Montane oak-hickory slope", aspect_degrees = 245.5, elevation_ft = 4056, slope_pct = 41.6, hr1 = 0.1, litter_depth_ref = 2.4, hr10 = 0.3, duff_depth_ref = 2.5, hr100 = 0.7, fuel_height_ref = 3.4, fine_woody = 1.1, coarse_woody = 0.0, shrub_cover_pct = 107.7, total_woody = 1.1, vegetation_lt1ft_pct = 3.0),
+  tibble(photo_num = 49, ecozone = "Dry oak evergreen heath", aspect_degrees = 273.3, elevation_ft = 3790, slope_pct = 19.7, hr1 = 0.2, litter_depth_ref = 2.1, hr10 = 0.3, duff_depth_ref = 0.6, hr100 = 2.5, fuel_height_ref = 5.2, fine_woody = 3.0, coarse_woody = 2.9, shrub_cover_pct = 0.0, total_woody = 5.9, vegetation_lt1ft_pct = 76.0),
+  tibble(photo_num = 50, ecozone = "Rich cove", aspect_degrees = 256.9, elevation_ft = 3858, slope_pct = 29.7, hr1 = 0.3, litter_depth_ref = 2.5, hr10 = 1.2, duff_depth_ref = 1.5, hr100 = 1.2, fuel_height_ref = 4.8, fine_woody = 2.7, coarse_woody = 3.3, shrub_cover_pct = 0.0, total_woody = 6.0, vegetation_lt1ft_pct = 5.0),
+  tibble(photo_num = 51, ecozone = "Northern hardwood cove", aspect_degrees = 280.4, elevation_ft = 4768, slope_pct = 8.7, hr1 = 0.3, litter_depth_ref = 2.2, hr10 = 0.7, duff_depth_ref = 1.6, hr100 = 1.8, fuel_height_ref = 15.9, fine_woody = 2.8, coarse_woody = 12.3, shrub_cover_pct = 0.0, total_woody = 15.1, vegetation_lt1ft_pct = 10.0),
+  tibble(photo_num = 52, ecozone = "Acidic cove", aspect_degrees = 296.5, elevation_ft = 3693, slope_pct = 17.0, hr1 = 0.2, litter_depth_ref = 1.3, hr10 = 0.9, duff_depth_ref = 0.9, hr100 = 2.4, fuel_height_ref = 1.1, fine_woody = 3.5, coarse_woody = 6.6, shrub_cover_pct = 41.8, total_woody = 10.1, vegetation_lt1ft_pct = 2.0),
+  tibble(photo_num = 53, ecozone = "Mixed oak rhododendron", aspect_degrees = 254.5, elevation_ft = 3895, slope_pct = 27.1, hr1 = 0.5, litter_depth_ref = 1.8, hr10 = 1.0, duff_depth_ref = 0.4, hr100 = 4.2, fuel_height_ref = 2.6, fine_woody = 5.7, coarse_woody = 5.9, shrub_cover_pct = 55.5, total_woody = 11.6, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 54, ecozone = "Northern hardwood slope", aspect_degrees = 255.4, elevation_ft = 4590, slope_pct = 26.4, hr1 = 0.2, litter_depth_ref = 2.2, hr10 = 1.2, duff_depth_ref = 0.7, hr100 = 2.9, fuel_height_ref = 3.6, fine_woody = 4.3, coarse_woody = 8.4, shrub_cover_pct = 0.0, total_woody = 12.7, vegetation_lt1ft_pct = 7.0),
+  tibble(photo_num = 55, ecozone = "High elevation red oak", aspect_degrees = 288.8, elevation_ft = 4997, slope_pct = 17.1, hr1 = 0.2, litter_depth_ref = 1.6, hr10 = 1.2, duff_depth_ref = 1.6, hr100 = 5.3, fuel_height_ref = 7.5, fine_woody = 6.7, coarse_woody = 18.8, shrub_cover_pct = 0.0, total_woody = 25.5, vegetation_lt1ft_pct = 10.0),
+  tibble(photo_num = 56, ecozone = "Acidic cove", aspect_degrees = 279.8, elevation_ft = 4009, slope_pct = 16.2, hr1 = 0.3, litter_depth_ref = 1.9, hr10 = 2.4, duff_depth_ref = 1.0, hr100 = 11.9, fuel_height_ref = 4.3, fine_woody = 14.6, coarse_woody = 13.7, shrub_cover_pct = 0.0, total_woody = 28.3, vegetation_lt1ft_pct = 7.0),
+  tibble(photo_num = 57, ecozone = "Pine-oak heath", aspect_degrees = 317.0, elevation_ft = 1859, slope_pct = 19.9, hr1 = 0.1, litter_depth_ref = 2.4, hr10 = 0.3, duff_depth_ref = 1.1, hr100 = 2.4, fuel_height_ref = 2.5, fine_woody = 2.8, coarse_woody = 0.4, shrub_cover_pct = 0.0, total_woody = 3.2, vegetation_lt1ft_pct = 5.5),
+  tibble(photo_num = 58, ecozone = "Dry mesic oak", aspect_degrees = 8.7, elevation_ft = 1296, slope_pct = 31.0, hr1 = 0.2, litter_depth_ref = 2.0, hr10 = 1.9, duff_depth_ref = 6.2, hr100 = 1.8, fuel_height_ref = 5.3, fine_woody = 3.9, coarse_woody = 3.4, shrub_cover_pct = 2.3, total_woody = 7.3, vegetation_lt1ft_pct = 14.0),
+  tibble(photo_num = 59, ecozone = "Dry mesic oak", aspect_degrees = 28.2, elevation_ft = 1270, slope_pct = 25.0, hr1 = 0.2, litter_depth_ref = 1.4, hr10 = 1.6, duff_depth_ref = 1.3, hr100 = 2.9, fuel_height_ref = 4.1, fine_woody = 4.7, coarse_woody = 4.4, shrub_cover_pct = 0.0, total_woody = 9.1, vegetation_lt1ft_pct = 35.0),
+  tibble(photo_num = 60, ecozone = "Low elevation pine", aspect_degrees = 38.0, elevation_ft = 1267, slope_pct = 19.7, hr1 = 0.3, litter_depth_ref = 1.6, hr10 = 2.1, duff_depth_ref = 2.8, hr100 = 2.9, fuel_height_ref = 6.8, fine_woody = 5.3, coarse_woody = 7.6, shrub_cover_pct = 37.9, total_woody = 12.9, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 61, ecozone = "Dry mesic oak", aspect_degrees = 22.4, elevation_ft = 2769, slope_pct = 21.3, hr1 = 0.4, litter_depth_ref = 2.1, hr10 = 0.7, duff_depth_ref = 1.7, hr100 = 0.6, fuel_height_ref = 5.7, fine_woody = 1.7, coarse_woody = 2.1, shrub_cover_pct = 6.7, total_woody = 3.8, vegetation_lt1ft_pct = 100.0),
+  tibble(photo_num = 62, ecozone = "Acidic cove", aspect_degrees = 42.5, elevation_ft = 2084, slope_pct = 11.5, hr1 = 0.4, litter_depth_ref = 1.5, hr10 = 1.0, duff_depth_ref = 2.3, hr100 = 0.6, fuel_height_ref = 6.5, fine_woody = 2.0, coarse_woody = 1.0, shrub_cover_pct = 42.0, total_woody = 3.0, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 63, ecozone = "Rich cove", aspect_degrees = 352.5, elevation_ft = 2244, slope_pct = 22.2, hr1 = 0.2, litter_depth_ref = 2.2, hr10 = 0.7, duff_depth_ref = 1.8, hr100 = 1.2, fuel_height_ref = 3.8, fine_woody = 2.1, coarse_woody = 1.4, shrub_cover_pct = 0.0, total_woody = 3.5, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 64, ecozone = "Acidic cove", aspect_degrees = 320.9, elevation_ft = 3428, slope_pct = 3.3, hr1 = 0.4, litter_depth_ref = 2.6, hr10 = 0.2, duff_depth_ref = 1.9, hr100 = 3.0, fuel_height_ref = 6.2, fine_woody = 3.6, coarse_woody = 17.3, shrub_cover_pct = 43.1, total_woody = 20.9, vegetation_lt1ft_pct = 26.0),
+  tibble(photo_num = 65, ecozone = "Low elevation pine", aspect_degrees = 38.8, elevation_ft = 2782, slope_pct = 17.4, hr1 = 0.3, litter_depth_ref = 1.5, hr10 = 1.5, duff_depth_ref = 1.7, hr100 = 2.3, fuel_height_ref = 3.1, fine_woody = 4.1, coarse_woody = 3.1, shrub_cover_pct = 0.0, total_woody = 7.2, vegetation_lt1ft_pct = 83.0),
+  tibble(photo_num = 66, ecozone = "Acidic cove", aspect_degrees = 318.8, elevation_ft = 3442, slope_pct = 4.7, hr1 = 0.7, litter_depth_ref = 2.5, hr10 = 0.9, duff_depth_ref = 2.4, hr100 = 4.7, fuel_height_ref = 5.7, fine_woody = 6.3, coarse_woody = 3.1, shrub_cover_pct = 32.6, total_woody = 9.4, vegetation_lt1ft_pct = 1.0),
+  tibble(photo_num = 67, ecozone = "Acidic cove", aspect_degrees = 17.6, elevation_ft = 3555, slope_pct = 24.1, hr1 = 0.2, litter_depth_ref = 2.7, hr10 = 0.6, duff_depth_ref = 1.2, hr100 = 0.0, fuel_height_ref = 3.9, fine_woody = 0.8, coarse_woody = 6.0, shrub_cover_pct = 0.0, total_woody = 6.8, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 68, ecozone = "Northern hardwood cove", aspect_degrees = 28.9, elevation_ft = 4031, slope_pct = 21.1, hr1 = 0.2, litter_depth_ref = 2.7, hr10 = 0.3, duff_depth_ref = 2.7, hr100 = 0.6, fuel_height_ref = 2.2, fine_woody = 1.1, coarse_woody = 5.7, shrub_cover_pct = 0.0, total_woody = 6.8, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 69, ecozone = "Acidic cove", aspect_degrees = 317.9, elevation_ft = 4043, slope_pct = 7.9, hr1 = 0.4, litter_depth_ref = 2.6, hr10 = 0.2, duff_depth_ref = 2.3, hr100 = 1.4, fuel_height_ref = 4.2, fine_woody = 2.0, coarse_woody = 1.6, shrub_cover_pct = 29.3, total_woody = 3.6, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 70, ecozone = "Montane oak-hickory slope", aspect_degrees = 25.6, elevation_ft = 4138, slope_pct = 23.0, hr1 = 0.6, litter_depth_ref = 2.1, hr10 = 1.3, duff_depth_ref = 1.6, hr100 = 1.2, fuel_height_ref = 4.2, fine_woody = 3.1, coarse_woody = 9.0, shrub_cover_pct = 0.0, total_woody = 12.1, vegetation_lt1ft_pct = 0.0),
+  tibble(photo_num = 71, ecozone = "Acidic cove", aspect_degrees = 355.7, elevation_ft = 3638, slope_pct = 14.1, hr1 = 0.4, litter_depth_ref = 1.8, hr10 = 2.1, duff_depth_ref = 2.1, hr100 = 1.2, fuel_height_ref = 5.6, fine_woody = 3.7, coarse_woody = 1.0, shrub_cover_pct = 0.0, total_woody = 4.7, vegetation_lt1ft_pct = 3.0),
+  tibble(photo_num = 72, ecozone = "Acidic cove", aspect_degrees = 26.4, elevation_ft = 3683, slope_pct = 18.1, hr1 = 0.5, litter_depth_ref = 1.9, hr10 = 1.1, duff_depth_ref = 1.6, hr100 = 2.4, fuel_height_ref = 3.6, fine_woody = 4.0, coarse_woody = 0.5, shrub_cover_pct = 74.2, total_woody = 4.5, vegetation_lt1ft_pct = 7.0),
+  tibble(photo_num = 73, ecozone = "Rich cove", aspect_degrees = 37.7, elevation_ft = 3867, slope_pct = 31.2, hr1 = 0.4, litter_depth_ref = 1.7, hr10 = 1.3, duff_depth_ref = 1.5, hr100 = 3.5, fuel_height_ref = 3.5, fine_woody = 5.2, coarse_woody = 17.3, shrub_cover_pct = 0.0, total_woody = 22.5, vegetation_lt1ft_pct = 1.0),
+  tibble(photo_num = 74, ecozone = "Northern hardwood slope", aspect_degrees = 356.4, elevation_ft = 5314, slope_pct = 24.6, hr1 = 0.3, litter_depth_ref = 1.8, hr10 = 1.2, duff_depth_ref = 2.5, hr100 = 3.5, fuel_height_ref = 13.5, fine_woody = 5.0, coarse_woody = 7.8, shrub_cover_pct = 0.0, total_woody = 12.8, vegetation_lt1ft_pct = 1.0)
+)
+
 build_photo_guide_options <- function() {
   group_specs <- tribble(
     ~aspect_band, ~elevation_band, ~photo_start, ~photo_end,
@@ -751,12 +952,6 @@ build_photo_guide_options <- function() {
     "316–45", "≥3,500 feet", 67, 74
   )
   
-  ecozones <- c(
-    "Low elevation pine", "Acidic cove", "Dry mesic oak", "Dry oak evergreen heath",
-    "Montane oak-hickory", "Pine-oak heath", "Rich cove", "Northern hardwood cove",
-    "Mixed oak rhododendron", "Northern hardwood slope", "High elevation red oak"
-  )
-  
   map_dfr(seq_len(nrow(group_specs)), function(i) {
     g <- group_specs[i, ]
     tibble(
@@ -765,13 +960,13 @@ build_photo_guide_options <- function() {
       elevation_band = g$elevation_band
     )
   }) %>%
+    left_join(photo_guide_reference_data, by = "photo_num") %>%
     mutate(
       photo_id = sprintf("P%02d", photo_num),
       site_type = paste("PHOTO", photo_num),
-      ecozone = ecozones[(photo_num %% length(ecozones)) + 1],
       vegetation_type = ecozone,
-      litter_factor = round(0.80 + (photo_num %% 9) * 0.18, 2),
-      duff_factor   = round(0.60 + (photo_num %% 11) * 0.33, 2),
+      litter_factor = LITTER_TONS_PER_ACRE_PER_INCH,
+      duff_factor = DUFF_TONS_PER_ACRE_PER_INCH,
       image_url = map2_chr(photo_num, elevation_band, photo_image_url),
       local_path = ifelse(is.na(image_url), NA_character_, file.path("www", image_url)),
       image_exists = !is.na(local_path) & file.exists(local_path)
@@ -780,6 +975,11 @@ build_photo_guide_options <- function() {
       photo_id, photo_num, site_type, ecozone,
       elevation_band, aspect_band, vegetation_type,
       litter_factor, duff_factor,
+      hr1, hr10, hr100,
+      litter_depth_ref, duff_depth_ref, fuel_height_ref,
+      fine_woody, coarse_woody, total_woody,
+      aspect_degrees, elevation_ft, slope_pct,
+      shrub_cover_pct, vegetation_lt1ft_pct,
       image_url, local_path, image_exists
     )
 }
@@ -791,10 +991,6 @@ photo_source_note <- sprintf(
   sum(photo_guide_options$image_exists)
 )
 
-# ---------------------------
-# UI
-# ---------------------------
-
 ui <- page_sidebar(
   title = div(
     class = "app-title-wrap",
@@ -803,41 +999,44 @@ ui <- page_sidebar(
   ),
   theme = bs_theme(
     version = 5,
-    bootswatch = "minty",
-    primary = "#1F6F5D",
-    secondary = "#5C6D7A",
-    bg = "#F4F7F9",
-    fg = "#1E293B",
-    base_font = font_google("Inter")
+    bootswatch = "minty"
   ),
-  
   sidebar = sidebar(
-    width = 350,
+    width = 340,
     
-    div(class = "section-heading", "Burn Location"),
-    numericInput("latitude", "Latitude:", value = 40.7128, min = -90, max = 90, step = 0.0001),
-    numericInput("longitude", "Longitude:", value = -74.0060, min = -180, max = 180, step = 0.0001),
+    div(class = "section-heading", "Location"),
+    numericInput("latitude", "latitude:", value = 40.7128, min = -90, max = 90, step = 0.0001),
+    numericInput("longitude", "longitude:", value = -74.0060, min = -180, max = 180, step = 0.0001),
     
-    div(class = "section-heading", "Burn Parameters"),
-    numericInput("acres", "Acres to burn:", value = 100, min = 1, max = 10000, step = 1),
-    numericInput("duration", "Duration of active flaming fire (hours):", value = 4, min = 0.5, max = 24, step = 0.5),
+    div(class = "section-heading", "Burn Characteristics"),
+    numericInput("acres", "Burn size (acres):", value = 100, min = 1, max = 50000, step = 1),
+    numericInput("duration", "Burn duration (hours):", value = 4, min = 0.25, max = 48, step = 0.25),
     selectInput(
-      "ignition_method", "Ignition method:",
+      "fuel_type", "Fuel type:",
+      choices = c("Grass", "Shrub", "Hardwood Litter", "Conifer Litter", "Logging Slash", "Heavy Fuels"),
+      selected = "Hardwood Litter"
+    ),
+    selectInput(
+      "fuel_load_source",
+      "Fuel loading source:",
+      choices = c(
+        "Manual entry" = "manual",
+        "Use Duff/Litter total" = "calculator_total",
+        "Use AI photo match total" = "ai_total"
+      ),
+      selected = "manual"
+    ),
+    uiOutput("fuel_load_ui"),
+    sliderInput("consumed_fraction", "Fuel consumed fraction", min = 0.05, max = 1.00, value = 0.30, step = 0.05),
+    selectInput(
+      "ignition_method",
+      "Ignition method:",
       choices = c("Backing/Spot", "Head/Aerial"),
       selected = "Backing/Spot"
     ),
     
-    div(class = "section-heading", "Fuel Characteristics"),
-    selectInput(
-      "fuel_type", "Fuel Type:",
-      choices = c("Grass", "Shrub", "Hardwood Litter", "Conifer Litter", "Logging Slash", "Heavy Fuels"),
-      selected = "Hardwood Litter"
-    ),
-    numericInput("fuel_load", "Fuel load (tons/acre):", value = 5, min = 0.1, max = 50, step = 0.1),
-    sliderInput("consumed_fraction", "Fuel consumed fraction", min = 0.05, max = 1.00, value = 0.30, step = 0.05),
-    
     div(class = "section-heading", "Weather Conditions"),
-    numericInput("wind_speed", "Transport wind speed (m/s):", value = 5, min = 0.5, max = 20, step = 0.5),
+    numericInput("wind_speed", "Transport wind speed (m/s):", value = 5, min = 0.5, max = 25, step = 0.5),
     selectInput(
       "wind_direction",
       "Wind direction smoke travels toward:",
@@ -857,6 +1056,12 @@ ui <- page_sidebar(
     numericInput("plume_base", "Initial plume base (m):", value = 15, min = 0, max = 200, step = 1),
     sliderInput("convective_fraction", "Convective heat fraction", min = 0.10, max = 0.60, value = 0.35, step = 0.05),
     numericInput("background_pm25", "Background PM2.5 (µg/m³):", value = 5, min = 0, max = 100, step = 1),
+    selectInput(
+      "fuel_moisture",
+      "Surrounding fuels / duff condition:",
+      choices = c("Very Dry", "Dry", "Moderate", "Moist", "Very Moist"),
+      selected = "Moderate"
+    ),
     
     div(class = "section-heading", "VSMOKE-Style Controls"),
     sliderInput("plume_rise_fraction", "Plume rise fraction (-1 to 1)", min = -1.0, max = 1.0, value = -0.5, step = 0.05),
@@ -879,42 +1084,114 @@ ui <- page_sidebar(
       .app-title-main { font-size:1.2rem; font-weight:700; letter-spacing:0.01em; }
       .app-title-sub { font-size:0.8rem; color:#5c6d7a; font-weight:500; }
       .section-heading {
-        font-size:0.84rem; letter-spacing:0.08em; text-transform:uppercase;
-        font-weight:700; color:#1f6f5d; border-bottom:1px solid #e4ecef;
-        padding-bottom:0.35rem; margin:1rem 0 0.6rem 0;
+        font-size:0.84rem; letter-spacing:0.04em; text-transform:uppercase;
+        font-weight:700; color:#567; margin-top:0.9rem; margin-bottom:0.5rem;
       }
-      .calc-note { color: #4b5563; margin-bottom: 0.75rem; }
-      .card { border:1px solid #d8e2e8; box-shadow:0 10px 24px rgba(15,23,42,0.05); }
-      .leaflet-container { border-radius:0.8rem; border:1px solid #d9e3e9; }
-      .nav-pills .nav-link.active { background-color:#1f6f5d; }
-
-      .value-box .value-box-value,
-      .value-box .value-box-title {
-        word-break: break-word;
-        overflow-wrap: anywhere;
-      }
-      .value-box .value-box-title {
-        font-size: 0.9rem;
-        line-height: 1.15;
-      }
-      .value-box .value-box-value {
-        font-size: clamp(1rem, 1.45vw, 1.75rem);
-        line-height: 1.15;
-      }
-      .value-box { min-height: 165px; }
-
+      .calc-note { color:#5c6d7a; font-size:0.92rem; }
       .photo-grid {
         display:grid;
-        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-        gap:0.75rem;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap:12px;
         margin-top:0.75rem;
       }
-      .photo-item { border:1px solid #d8e2e8; border-radius:0.5rem; background:#fff; overflow:hidden; }
-      .photo-item img { width:100%; height:110px; object-fit:cover; display:block; }
-      .photo-caption { padding:0.5rem; font-size:0.8rem; color:#334155; font-weight:600; }
-      .selected-photo-wrap { margin-top:0.75rem; }
-      .selected-photo-wrap img { width:100%; border:1px solid #d8e2e8; border-radius:0.6rem; display:block; }
+      .photo-card {
+        border:1px solid #d8e2e8;
+        border-radius:12px;
+        background:#fff;
+        overflow:hidden;
+        box-shadow:0 2px 6px rgba(0,0,0,0.06);
+        padding: 0;
+        height: 100%;
+      }
+      .photo-thumb {
+        width:100%;
+        height:190px;
+        object-fit:cover;
+        display:block;
+        cursor:zoom-in;
+      }
+      .photo-caption {
+        padding:0.5rem;
+        font-size:0.8rem;
+        color:#334155;
+        font-weight:600;
+      }
+      .selected-photo-wrap, .preview-card {
+        margin-top:0.75rem;
+        background:#ffffff;
+        border:1px solid #d9d9d9;
+        border-radius:12px;
+        padding:14px;
+        box-shadow:0 2px 6px rgba(0,0,0,0.05);
+      }
+      .selected-photo-wrap img, .preview-card img {
+        width:100%;
+        max-height:420px;
+        object-fit:contain;
+        border:1px solid #d8e2e8;
+        border-radius:10px;
+        display:block;
+        background:#fff;
+      }
       .warn-missing { color:#b91c1c; font-weight:800; margin-top:0.5rem; }
+      .result-panel {
+        border-radius:10px;
+        padding:18px;
+        color:white;
+        font-weight:600;
+        min-height:160px;
+        margin-bottom:14px;
+        white-space:pre-line;
+        display:flex;
+        flex-direction:column;
+        justify-content:center;
+      }
+      .result-dark { background:#227b68; }
+      .result-light { background:#58c49a; }
+      .result-gold { background:#f0c35a; color:#274060; }
+      .result-box {
+        background:#f8f9fa;
+        border:1px solid #dee2e6;
+        border-radius:10px;
+        padding:12px;
+        white-space:pre-wrap;
+      }
+      .ai-two-col {
+        display:grid;
+        grid-template-columns:380px 1fr;
+        gap:18px;
+        align-items:start;
+      }
+      .match-box-photo-wrap {
+        width:100%;
+        text-align:center;
+        background:transparent;
+      }
+      .match-box-photo {
+        width:auto;
+        max-width:100%;
+        max-height:320px;
+        height:auto;
+        object-fit:contain;
+        border-radius:10px;
+        background:transparent;
+        border:none;
+        cursor:zoom-in;
+        display:inline-block;
+      }
+      .gallery-search-wrap {
+        max-width: 420px;
+        margin-bottom: 12px;
+      }
+      .ai-thumb-small {
+        width:42px;
+        height:42px;
+        object-fit:cover;
+        border-radius:8px;
+        border:1px solid #d8e2e8;
+        display:block;
+        margin:auto;
+      }
     "))
   ),
   
@@ -925,23 +1202,23 @@ ui <- page_sidebar(
         card_body(
           layout_columns(
             col_widths = c(4, 4, 4),
-            value_box(
-              title = "Prediction Status",
-              value = textOutput("status_text"),
-              showcase = icon("wind"),
-              theme = "primary"
+            
+            div(
+              class = "result-panel result-dark",
+              tags$div("Prediction Status", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("status_text")
             ),
-            value_box(
-              title = "Current Fuel Option",
-              value = textOutput("selected_fuel_text"),
-              showcase = icon("leaf"),
-              theme = "secondary"
+            
+            div(
+              class = "result-panel result-light",
+              tags$div("Current Fuel Option", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("selected_fuel_text")
             ),
-            value_box(
-              title = "Wind Profile",
-              value = textOutput("wind_profile_text"),
-              showcase = icon("compass"),
-              theme = "success"
+            
+            div(
+              class = "result-panel result-gold",
+              tags$div("Wind Profile", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("wind_profile_text")
             )
           )
         )
@@ -958,46 +1235,66 @@ ui <- page_sidebar(
     ),
     
     nav_panel(
-      "Diff/Litter Calculator",
+      "Duff/Litter Calculator",
       layout_columns(
         col_widths = c(4, 8),
         
         card(
           full_screen = TRUE,
-          card_header("Photo Guide Inputs"),
+          card_header("Select Vegetation Type + Photo"),
           div(class = "calc-note", textOutput("photo_source_text")),
+          p(
+            class = "calc-note",
+            "Choose a vegetation type first. Then the photo list will filter to matching guide photos only."
+          ),
           
           selectInput(
-            "elevation_filter", "Elevation",
-            choices = c("1,000–1,999 feet", "2,000–3,499 feet", "≥3,500 feet"),
-            selected = "1,000–1,999 feet"
-          ),
-          selectInput(
-            "aspect_filter", "Aspect",
-            choices = c("46–135", "136–225", "226–315", "316–45"),
-            selected = "46–135"
-          ),
-          selectInput(
-            "vegetation_filter", "Vegetation type (guide class)",
+            "manual_vegetation_type",
+            "Vegetation type:",
             choices = sort(unique(photo_guide_options$vegetation_type)),
             selected = sort(unique(photo_guide_options$vegetation_type))[1]
           ),
-          selectInput("photo_option", "Photo guide option", choices = photo_guide_options$photo_id),
-          
-          uiOutput("photo_gallery"),
-          uiOutput("selected_photo_view"),
           
           numericInput("litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
-          numericInput("duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1)
+          numericInput("duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
+          
+          uiOutput("manual_photo_select_ui"),
+          uiOutput("selected_photo_view"),
+          
+          br(),
+          h5("Filtered Photo Gallery"),
+          tags$p(class = "calc-note", "Only photos matching the selected vegetation type are shown below."),
+          uiOutput("photo_gallery")
         ),
         
         card(
           full_screen = TRUE,
           card_header("Estimated Fuel Loading"),
-          p(class = "calc-note", "Select an environment + photo option. The app will display the matching PNG from your www/ subfolders."),
-          value_box(title = "Litter mass", value = textOutput("litter_mass_text"), theme = "success"),
-          value_box(title = "Duff mass", value = textOutput("duff_mass_text"), theme = "warning"),
-          value_box(title = "Total (litter + duff)", value = textOutput("total_mass_text"), theme = "primary"),
+          p(class = "calc-note", "The selected photo supplies the pre-determined woody debris loads. Your entered litter and duff depths are converted using 1.38 tons/acre/inch for litter and 4.84 tons/acre/inch for duff, then combined into the fuel loading source total."),
+          div(class = "result-panel result-light",
+              tags$div("Litter mass", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("litter_mass_text")
+          ),
+          div(class = "result-panel result-gold",
+              tags$div("Duff mass", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("duff_mass_text")
+          ),
+          div(class = "result-panel result-dark",
+              tags$div("Total fuel loading source", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("total_mass_text")
+          ),
+          div(class = "result-panel result-light",
+              tags$div("Fine woody debris (1+10+100-hr)", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("fine_woody_text")
+          ),
+          div(class = "result-panel result-gold",
+              tags$div("Coarse woody debris (1,000-hr)", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("coarse_woody_text")
+          ),
+          div(class = "result-panel result-dark",
+              tags$div("Total woody fuels", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("total_woody_text")
+          ),
           DTOutput("photo_factor_table")
         )
       )
@@ -1005,64 +1302,93 @@ ui <- page_sidebar(
     
     nav_panel(
       "AI Photo Match Calculator",
-      layout_columns(
-        col_widths = c(4, 8),
+      div(
+        class = "ai-two-col",
         
-        card(
-          full_screen = TRUE,
-          card_header("Upload a Photo to Match"),
-          p(class = "calc-note", "Upload a forest fuel / litter photo. OpenAI will compare it to the guide photos in your www folder and return the closest match."),
-          
+        div(
+          class = "preview-card",
+          tags$h4("Upload a Photo to Match"),
+          p("Upload a forest fuel / litter photo. OpenAI will compare it to the guide photos in your www folder and return the closest match. The matched photo supplies the pre-determined woody debris loads, and your litter/duff depths are converted using 1.38 and 4.84 tons/acre/inch."),
           fileInput(
             "ai_photo_upload",
             "Upload photo",
             accept = c(".png", ".jpg", ".jpeg", ".webp")
           ),
-          
           numericInput("ai_litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
           numericInput("ai_duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
-          
+          checkboxInput("show_ai_recommendation", "Show recommendation", value = TRUE),
           actionButton(
             "match_uploaded_photo",
             "Find Closest Guide Photo",
             class = "btn-primary",
             style = "width: 100%;"
           ),
-          
           br(), br(),
           textOutput("ai_match_status"),
           uiOutput("uploaded_photo_preview")
         ),
         
-        card(
-          full_screen = TRUE,
-          card_header("Best Match Result"),
+        div(
+          class = "preview-card",
+          tags$h4("Best Match Result"),
           
-          value_box(
-            title = "Best Match",
-            value = textOutput("ai_best_match_text"),
-            theme = "primary"
-          ),
-          value_box(
-            title = "Similarity",
-            value = textOutput("ai_similarity_text"),
-            theme = "success"
-          ),
-          value_box(
-            title = "Estimated Litter + Duff",
-            value = textOutput("ai_total_mass_text"),
-            theme = "warning"
+          div(
+            class = "result-panel result-dark",
+            tags$div("Best Match", style = "font-weight:700; margin-bottom:12px;"),
+            uiOutput("ai_best_match_box")
           ),
           
-          uiOutput("ai_best_match_view"),
+          div(class = "result-panel result-light",
+              tags$div("Similarity", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("ai_similarity_text")
+          ),
+          div(class = "result-panel result-light",
+              tags$div("Litter mass", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("ai_litter_mass_text")
+          ),
+          div(class = "result-panel result-gold",
+              tags$div("Duff mass", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("ai_duff_mass_text")
+          ),
+          div(class = "result-panel result-dark",
+              tags$div("Total fuel loading source", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("ai_total_mass_text")
+          ),
+          div(class = "result-panel result-light",
+              tags$div("Fine woody debris (1+10+100-hr)", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("ai_fine_woody_text")
+          ),
+          div(class = "result-panel result-gold",
+              tags$div("Coarse woody debris (1,000-hr)", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("ai_coarse_woody_text")
+          ),
+          div(class = "result-panel result-dark",
+              tags$div("Total woody fuels", style = "font-weight:700; margin-bottom:10px;"),
+              textOutput("ai_total_woody_text")
+          ),
+          
+          conditionalPanel(
+            condition = "input.show_ai_recommendation == true",
+            tags$h4("Recommendation"),
+            div(class = "result-box", textOutput("ai_recommendation"))
+          ),
+          
           br(),
-          h5("Recommendation"),
-          verbatimTextOutput("ai_recommendation"),
-          br(),
-          h5("Top Matches"),
+          tags$h4("Top Matches"),
           DTOutput("ai_match_table")
         )
       )
+    ),
+    
+    nav_panel(
+      "Full Photo Gallery",
+      h4("Full Guide Photo Gallery"),
+      div(class = "calc-note", textOutput("photo_source_text")),
+      div(
+        class = "gallery-search-wrap",
+        textInput("full_gallery_search", "Search photos", placeholder = "Search by photo ID, ecozone, vegetation, elevation, aspect, or site type")
+      ),
+      uiOutput("full_photo_gallery")
     ),
     
     nav_panel(
@@ -1078,8 +1404,16 @@ ui <- page_sidebar(
           tags$li("AQI mapping uses raw concentration instead of broad smoothing."),
           tags$li("The map now appears immediately, even before you generate a prediction."),
           tags$li("Clicking the map sets the burn location and updates the latitude/longitude inputs."),
-          tags$li("The AI Photo Match Calculator uses OpenAI-only final ranking and no local fallback."),
-          tags$li("The matching loop now catches per-candidate errors instead of dying at index 1.")
+          tags$li("The AI Photo Match Calculator uses GPT-5.4 mini with direct API requests."),
+          tags$li("The AI button crash from validate() inside observeEvent is fixed."),
+          tags$li("The full photo gallery is now on its own tab and has a search bar."),
+          tags$li("The Best Match photo appears inside the green Best Match box."),
+          tags$li("The separate Best Match Photo section at the bottom was removed."),
+          tags$li("Recommendation can be turned on or off in the AI tab."),
+          tags$li("Top Matches now include Elevation, Aspect, and a small photo thumbnail next to Similarity."),
+          tags$li("White side bars around the best-match image were removed by centering the image without a white photo frame."),
+          tags$li("All result boxes now use even heights."),
+          tags$li("Photo viewing now happens inside the app with a modal preview.")
         ),
         tags$h5("Important note:"),
         tags$p("This is a closer screening depiction, not a regulatory or exact VSMOKE clone.")
@@ -1087,10 +1421,6 @@ ui <- page_sidebar(
     )
   )
 )
-
-# ---------------------------
-# Server
-# ---------------------------
 
 server <- function(input, output, session) {
   
@@ -1130,78 +1460,183 @@ server <- function(input, output, session) {
     updateNumericInput(session, "latitude", value = round(click$lat, 6))
     updateNumericInput(session, "longitude", value = round(click$lng, 6))
     
-    values$status <- paste0(
-      "Burn location selected from map: ",
-      round(click$lat, 6), ", ",
-      round(click$lng, 6),
-      ". Press Generate Smoke Prediction to run the model."
+    showNotification(
+      paste0("Burn location updated to ", round(click$lat, 6), ", ", round(click$lng, 6)),
+      type = "message",
+      duration = 3
     )
+    
+    values$status <- "Map ready. Click the map or enter coordinates, then generate prediction."
   })
   
   output$status_text <- renderText(values$status)
   output$selected_fuel_text <- renderText(
-    paste(input$fuel_type, "|", input$fuel_load, "tons/acre |", round(100 * input$consumed_fraction), "% consumed")
+    paste(input$fuel_type, "|", round(effective_fuel_load(), 2), "tons/acre |", fuel_load_source_label(), "|", round(100 * input$consumed_fraction), "% consumed")
   )
   output$wind_profile_text <- renderText(
     paste0(
       input$wind_speed, " m/s toward ", input$wind_direction,
       " | MH: ", input$mixing_height, " m",
-      " | PRF: ", input$plume_rise_fraction
+      " | Fuels: ", input$fuel_moisture
     )
   )
   output$photo_source_text <- renderText(photo_source_note)
   
-  filtered_photo_options <- reactive({
-    photo_guide_options %>%
-      filter(
-        elevation_band == input$elevation_filter,
-        aspect_band == input$aspect_filter,
-        vegetation_type == input$vegetation_filter
-      )
-  })
-  
-  observeEvent(filtered_photo_options(), {
-    filtered <- filtered_photo_options()
-    choices <- filtered$photo_id
-    
-    if (length(choices) == 0) {
-      updateSelectInput(session, "photo_option", choices = character(0), selected = character(0))
-      return()
+  output$fuel_load_ui <- renderUI({
+    if (identical(input$fuel_load_source, "manual")) {
+      return(numericInput("fuel_load", "Fuel loading (tons/acre):", value = 5, min = 0.1, max = 100, step = 0.1))
     }
     
-    selected <- if (input$photo_option %in% choices) input$photo_option else choices[[1]]
-    updateSelectInput(session, "photo_option", choices = choices, selected = selected)
-  }, ignoreInit = FALSE)
+    if (identical(input$fuel_load_source, "calculator_total")) {
+      calc <- tryCatch(photo_calc(), error = function(e) NULL)
+      if (is.null(calc) || is.null(calc$total_mass) || is.na(calc$total_mass)) {
+        return(div(class = "calc-note", tags$strong("Calculator fuel loading source total unavailable."), " Select a calculator photo first."))
+      }
+      return(div(class = "calc-note", tags$strong("Using calculator fuel loading source total: "), paste0(round(calc$total_mass, 2), " tons/acre")))
+    }
+    
+    calc <- tryCatch(ai_photo_calc(), error = function(e) NULL)
+    if (is.null(calc) || is.null(calc$total_mass) || is.na(calc$total_mass)) {
+      return(div(class = "calc-note", tags$strong("AI photo match fuel loading source total unavailable."), " Run the AI photo match first."))
+    }
+    div(class = "calc-note", tags$strong("Using AI photo match fuel loading source total: "), paste0(round(calc$total_mass, 2), " tons/acre"))
+  })
+  
+  effective_fuel_load <- reactive({
+    if (identical(input$fuel_load_source, "calculator_total")) {
+      calc <- photo_calc()
+      req(!is.null(calc$total_mass), !is.na(calc$total_mass))
+      return(calc$total_mass)
+    }
+    if (identical(input$fuel_load_source, "ai_total")) {
+      calc <- ai_photo_calc()
+      req(!is.null(calc$total_mass), !is.na(calc$total_mass))
+      return(calc$total_mass)
+    }
+    req(input$fuel_load)
+    input$fuel_load
+  })
+  
+  fuel_load_source_label <- reactive({
+    if (identical(input$fuel_load_source, "calculator_total")) {
+      return("Calculator fuel loading source total")
+    }
+    if (identical(input$fuel_load_source, "ai_total")) {
+      return("AI photo match fuel loading source total")
+    }
+    "Manual"
+  })
+  
+  manual_filtered <- reactive({
+    photo_guide_options %>%
+      filter(vegetation_type == input$manual_vegetation_type)
+  })
+  
+  output$manual_photo_select_ui <- renderUI({
+    filtered <- manual_filtered()
+    selectInput(
+      "manual_photo_id",
+      "Choose photo:",
+      choices = setNames(filtered$photo_id, paste(filtered$photo_id, "-", filtered$site_type, "(", filtered$ecozone, ")")),
+      selected = filtered$photo_id[[1]]
+    )
+  })
   
   selected_photo <- reactive({
-    filtered <- filtered_photo_options()
-    req(nrow(filtered) > 0)
-    
-    sel <- filtered %>% filter(photo_id == input$photo_option) %>% slice(1)
-    if (nrow(sel) == 0) sel <- filtered %>% slice(1)
-    sel
+    req(input$manual_photo_id)
+    photo_guide_options %>% filter(photo_id == input$manual_photo_id)
   })
   
   output$photo_gallery <- renderUI({
-    filtered <- filtered_photo_options() %>% slice_head(n = 6)
-    if (nrow(filtered) == 0) return(tags$p("No photo options match the selected filters."))
+    filtered <- manual_filtered()
     
     div(
       class = "photo-grid",
       lapply(seq_len(nrow(filtered)), function(i) {
-        img_rel <- filtered$image_url[i]
-        local_img <- if (!is.na(img_rel)) file.path("www", img_rel) else NA_character_
-        
-        img_tag <- if (!is.na(local_img) && file.exists(local_img)) {
-          tags$img(src = img_rel, alt = paste("Photo guide", filtered$photo_id[i]))
-        } else {
-          tags$div(class = "warn-missing", "Image missing")
-        }
+        img_id <- paste0("manual_gallery_img_", i)
         
         div(
-          class = "photo-item",
-          img_tag,
-          div(class = "photo-caption", paste(filtered$photo_id[i], "-", filtered$site_type[i]))
+          class = "photo-card",
+          tags$img(
+            src = filtered$image_url[i],
+            id = img_id,
+            class = "photo-thumb",
+            alt = paste("Photo guide", filtered$photo_id[i])
+          ),
+          div(
+            class = "photo-caption",
+            paste(filtered$photo_id[i], "-", filtered$site_type[i])
+          ),
+          tags$script(HTML(sprintf(
+            "document.getElementById('%s').onclick = function() {
+               Shiny.setInputValue('selected_gallery_image', %s, {priority: 'event'});
+             };",
+            img_id,
+            jsonlite::toJSON(list(
+              src = filtered$image_url[i],
+              label = paste(filtered$photo_id[i], "-", filtered$site_type[i]),
+              photo_id = filtered$photo_id[i],
+              ecozone = filtered$ecozone[i]
+            ), auto_unbox = TRUE)
+          )))
+        )
+      })
+    )
+  })
+  
+  full_gallery_filtered <- reactive({
+    q <- trimws(tolower(input$full_gallery_search %||% ""))
+    
+    df <- photo_guide_options
+    if (!nzchar(q)) return(df)
+    
+    df %>%
+      filter(
+        str_detect(tolower(photo_id), fixed(q)) |
+          str_detect(tolower(site_type), fixed(q)) |
+          str_detect(tolower(ecozone), fixed(q)) |
+          str_detect(tolower(vegetation_type), fixed(q)) |
+          str_detect(tolower(elevation_band), fixed(q)) |
+          str_detect(tolower(aspect_band), fixed(q))
+      )
+  })
+  
+  output$full_photo_gallery <- renderUI({
+    all_photos <- full_gallery_filtered()
+    
+    if (nrow(all_photos) == 0) {
+      return(div(class = "warn-missing", "No photos match your search."))
+    }
+    
+    div(
+      class = "photo-grid",
+      lapply(seq_len(nrow(all_photos)), function(i) {
+        img_id <- paste0("full_gallery_img_", i)
+        
+        div(
+          class = "photo-card",
+          tags$img(
+            src = all_photos$image_url[i],
+            id = img_id,
+            class = "photo-thumb",
+            alt = paste("Photo guide", all_photos$photo_id[i])
+          ),
+          div(
+            class = "photo-caption",
+            paste(all_photos$photo_id[i], "-", all_photos$site_type[i])
+          ),
+          tags$script(HTML(sprintf(
+            "document.getElementById('%s').onclick = function() {
+               Shiny.setInputValue('selected_gallery_image', %s, {priority: 'event'});
+             };",
+            img_id,
+            jsonlite::toJSON(list(
+              src = all_photos$image_url[i],
+              label = paste(all_photos$photo_id[i], "-", all_photos$site_type[i]),
+              photo_id = all_photos$photo_id[i],
+              ecozone = all_photos$ecozone[i]
+            ), auto_unbox = TRUE)
+          )))
         )
       })
     )
@@ -1221,7 +1656,33 @@ server <- function(input, output, session) {
     
     div(
       class = "selected-photo-wrap",
-      tags$img(src = img_rel, alt = paste("Selected", opt$photo_id[[1]]))
+      tags$img(
+        src = img_rel,
+        id = "selected_manual_photo",
+        class = "photo-thumb",
+        style = "height:auto; max-height:420px; object-fit:contain;",
+        alt = paste("Selected", opt$photo_id[[1]])
+      ),
+      div(
+        class = "photo-caption",
+        paste(
+          opt$photo_id[[1]], "-",
+          opt$site_type[[1]], "|",
+          opt$vegetation_type[[1]]
+        )
+      ),
+      tags$script(HTML(sprintf(
+        "document.getElementById('%s').onclick = function() {
+           Shiny.setInputValue('selected_gallery_image', %s, {priority: 'event'});
+         };",
+        "selected_manual_photo",
+        jsonlite::toJSON(list(
+          src = img_rel,
+          label = paste(opt$photo_id[[1]], "-", opt$site_type[[1]]),
+          photo_id = opt$photo_id[[1]],
+          ecozone = opt$ecozone[[1]]
+        ), auto_unbox = TRUE)
+      )))
     )
   })
   
@@ -1229,25 +1690,40 @@ server <- function(input, output, session) {
     opt <- selected_photo()
     req(nrow(opt) == 1)
     
-    litter_factor <- opt$litter_factor[[1]]
-    duff_factor <- opt$duff_factor[[1]]
+    litter_factor <- LITTER_TONS_PER_ACRE_PER_INCH
+    duff_factor <- DUFF_TONS_PER_ACRE_PER_INCH
     
     litter_mass <- input$litter_depth * litter_factor
     duff_mass <- input$duff_depth * duff_factor
+    litter_duff_total <- litter_mass + duff_mass
+    woody_total <- opt$total_woody[[1]]
     
     list(
       litter_mass = litter_mass,
       duff_mass = duff_mass,
-      total_mass = litter_mass + duff_mass,
+      litter_duff_total = litter_duff_total,
+      total_mass = litter_duff_total + woody_total,
       option = opt,
       litter_factor = litter_factor,
-      duff_factor = duff_factor
+      duff_factor = duff_factor,
+      fine_woody = opt$fine_woody[[1]],
+      coarse_woody = opt$coarse_woody[[1]],
+      total_woody = woody_total,
+      ref_litter_depth = opt$litter_depth_ref[[1]],
+      ref_duff_depth = opt$duff_depth_ref[[1]],
+      ref_fuel_height = opt$fuel_height_ref[[1]],
+      hr1 = opt$hr1[[1]],
+      hr10 = opt$hr10[[1]],
+      hr100 = opt$hr100[[1]]
     )
   })
   
   output$litter_mass_text <- renderText(paste0(round(photo_calc()$litter_mass, 2), " tons/acre"))
   output$duff_mass_text   <- renderText(paste0(round(photo_calc()$duff_mass, 2), " tons/acre"))
   output$total_mass_text  <- renderText(paste0(round(photo_calc()$total_mass, 2), " tons/acre"))
+  output$fine_woody_text  <- renderText(paste0(round(photo_calc()$fine_woody, 2), " tons/acre"))
+  output$coarse_woody_text <- renderText(paste0(round(photo_calc()$coarse_woody, 2), " tons/acre"))
+  output$total_woody_text <- renderText(paste0(round(photo_calc()$total_woody, 2), " tons/acre"))
   
   output$photo_factor_table <- renderDT({
     opt <- photo_calc()$option
@@ -1261,15 +1737,75 @@ server <- function(input, output, session) {
       Vegetation = opt$vegetation_type,
       `Litter factor (tons/acre/in)` = photo_calc()$litter_factor,
       `Duff factor (tons/acre/in)` = photo_calc()$duff_factor,
+      `Custom litter + duff subtotal` = photo_calc()$litter_duff_total,
+      `Guide litter depth (in)` = photo_calc()$ref_litter_depth,
+      `Guide duff depth (in)` = photo_calc()$ref_duff_depth,
+      `Guide fuel height (in)` = photo_calc()$ref_fuel_height,
+      `1-hr woody` = photo_calc()$hr1,
+      `10-hr woody` = photo_calc()$hr10,
+      `100-hr woody` = photo_calc()$hr100,
+      `Fine woody (1+10+100-hr)` = photo_calc()$fine_woody,
+      `Coarse woody (1,000-hr)` = photo_calc()$coarse_woody,
+      `Total woody fuels` = photo_calc()$total_woody,
+      `Fuel loading source total` = photo_calc()$total_mass,
       `Image path` = opt$image_url
     )
     
-    datatable(table_data, options = list(dom = "t"), rownames = FALSE)
+    datatable(table_data, options = list(scrollX = TRUE, dom = "t"), rownames = FALSE)
   })
   
-  # ---------------------------
-  # AI photo match tab
-  # ---------------------------
+  show_photo_modal <- function(photo_id, src, label = NULL, ecozone = NULL) {
+    showModal(
+      modalDialog(
+        title = paste("Photo Preview -", photo_id),
+        easyClose = TRUE,
+        size = "l",
+        footer = NULL,
+        tags$div(
+          style = "text-align:center;",
+          tags$img(
+            src = src,
+            style = "max-width:100%; max-height:80vh; border-radius:10px;"
+          ),
+          tags$hr(),
+          if (!is.null(label) && nzchar(label)) tags$p(strong("Label: "), label),
+          if (!is.null(ecozone) && nzchar(ecozone)) tags$p(strong("Ecozone: "), ecozone)
+        )
+      )
+    )
+  }
+  
+  observeEvent(input$selected_gallery_image, {
+    info <- input$selected_gallery_image
+    req(info)
+    show_photo_modal(
+      photo_id = info$photo_id,
+      src = info$src,
+      label = info$label,
+      ecozone = info$ecozone
+    )
+  })
+  
+  observeEvent(input$ai_match_photo_click, {
+    req(ai_match_values$matches)
+    idx <- suppressWarnings(as.integer(input$ai_match_photo_click))
+    req(!is.na(idx), idx >= 1, idx <= nrow(ai_match_values$matches))
+    
+    matches <- ai_match_values$matches %>%
+      coalesce_match_metadata(photo_guide_options) %>%
+      normalize_ai_matches()
+    
+    req(nrow(matches) >= idx)
+    photo_row <- matches[idx, ]
+    req(!is.na(photo_row$image_url), nzchar(photo_row$image_url))
+    
+    show_photo_modal(
+      photo_id = photo_row$photo_id,
+      src = photo_row$image_url,
+      label = paste(photo_row$site_type, "-", photo_row$vegetation_type),
+      ecozone = photo_row$ecozone
+    )
+  })
   
   output$ai_match_status <- renderText({
     ai_match_values$status
@@ -1290,8 +1826,8 @@ server <- function(input, output, session) {
     img_src <- base64enc::dataURI(file = input$ai_photo_upload$datapath, mime = mime)
     
     div(
-      class = "selected-photo-wrap",
-      tags$h5("Uploaded Photo"),
+      class = "preview-card",
+      tags$h4("Uploaded Photo"),
       tags$img(
         src = img_src,
         style = "max-width:100%; border:1px solid #d8e2e8; border-radius:0.6rem;"
@@ -1305,152 +1841,265 @@ server <- function(input, output, session) {
     ref_df <- photo_guide_options %>%
       filter(image_exists, !is.na(local_path), file.exists(local_path))
     
-    validate(
-      need(nrow(ref_df) > 0, "No guide photos were found in the www folder."),
-      need(nzchar(Sys.getenv("OPENAI_API_KEY")), "OPENAI_API_KEY is not set.")
-    )
+    if (nrow(ref_df) == 0) {
+      ai_match_values$status <- "No guide photos were found in the www folder."
+      ai_match_values$matches <- NULL
+      ai_match_values$recommendation <- "No recommendation available."
+      showNotification("No guide photos were found in the www folder.", type = "error")
+      return(NULL)
+    }
     
-    ai_match_values$status <- "Matching uploaded image with OpenAI..."
+    if (!nzchar(Sys.getenv("OPENAI_API_KEY"))) {
+      ai_match_values$status <- "OPENAI_API_KEY is not set."
+      ai_match_values$matches <- NULL
+      ai_match_values$recommendation <- "No recommendation available."
+      showNotification("OPENAI_API_KEY is not set.", type = "error")
+      return(NULL)
+    }
+    
+    ai_match_values$status <- "Matching uploaded image with OpenAI."
     ai_match_values$matches <- NULL
-    ai_match_values$recommendation <- NULL
+    ai_match_values$recommendation <- "Waiting for match results."
+    
+    local_candidates <- tryCatch(
+      find_candidate_matches_local(
+        upload_path = input$ai_photo_upload$datapath,
+        reference_df = ref_df,
+        top_n = 5
+      ),
+      error = function(e) tibble::tibble()
+    )
     
     tryCatch({
       matches <- find_top_matches_openai(
         upload_path = input$ai_photo_upload$datapath,
         reference_df = ref_df,
-        model = "gpt-4o-mini",
+        model = "gpt-5.4-mini",
         top_n = 5,
-        candidate_limit = 20
+        candidate_limit = 5
       )
+      
+      matches <- matches %>%
+        coalesce_match_metadata(photo_guide_options) %>%
+        normalize_ai_matches()
       
       if (is.null(matches) || nrow(matches) == 0) {
         stop("OpenAI returned no matches.")
       }
       
       ai_match_values$matches <- matches
-      
-      ai_match_values$recommendation <- ask_openai_assistant(
-        prompt = "Match this uploaded forest fuel photo to the closest guide photo and explain why.",
-        top_matches = matches,
-        model = "gpt-4o-mini"
-      )
-      
       ai_match_values$status <- "OpenAI match complete."
       
+      ai_match_values$recommendation <- tryCatch(
+        ask_openai_assistant(
+          prompt = "Match this uploaded forest fuel photo to the closest guide photo and explain why.",
+          top_matches = matches,
+          model = "gpt-5.4-mini"
+        ),
+        error = function(e) paste("OpenAI recommendation error:", e$message)
+      )
+      
     }, error = function(e) {
-      ai_match_values$matches <- NULL
-      ai_match_values$recommendation <- NULL
-      ai_match_values$status <- paste("OpenAI matching failed:", e$message)
+      err_msg <- as.character(e$message)
+      
+      if (grepl("\\[429\\]|rate limit", err_msg, ignore.case = TRUE) && nrow(local_candidates) > 0) {
+        fallback_matches <- local_candidates %>%
+          dplyr::arrange(prefilter_distance) %>%
+          dplyr::slice_head(n = 5) %>%
+          dplyr::mutate(
+            similarity = NA_real_,
+            openai_similarity = NA_real_,
+            openai_reason = paste0(
+              "OpenAI API error: ", err_msg,
+              " Local visual shortlist shown below while rate-limited."
+            )
+          ) %>%
+          coalesce_match_metadata(photo_guide_options) %>%
+          normalize_ai_matches()
+        
+        ai_match_values$matches <- fallback_matches
+        ai_match_values$recommendation <- "Recommendation skipped because the OpenAI rate limit was reached. Local visual shortlist results are shown below and can still be used."
+        ai_match_values$status <- "OpenAI rate-limited. Showing local visual shortlist."
+      } else {
+        ai_match_values$matches <- NULL
+        ai_match_values$recommendation <- paste("OpenAI recommendation error:", err_msg)
+        ai_match_values$status <- paste("OpenAI matching failed:", err_msg)
+        showNotification(ai_match_values$status, type = "error")
+      }
     })
   })
   
   best_ai_match <- reactive({
-    req(ai_match_values$matches)
-    req(nrow(ai_match_values$matches) > 0)
-    ai_match_values$matches %>% slice(1)
+    matches <- ai_match_values$matches %>%
+      coalesce_match_metadata(photo_guide_options) %>%
+      normalize_ai_matches()
+    req(nrow(matches) > 0)
+    matches %>% dplyr::slice(1)
   })
   
   ai_photo_calc <- reactive({
     best <- best_ai_match()
     
-    litter_mass <- input$ai_litter_depth * best$litter_factor[[1]]
-    duff_mass   <- input$ai_duff_depth * best$duff_factor[[1]]
+    litter_factor <- LITTER_TONS_PER_ACRE_PER_INCH
+    duff_factor <- DUFF_TONS_PER_ACRE_PER_INCH
+    
+    litter_mass <- input$ai_litter_depth * litter_factor
+    duff_mass   <- input$ai_duff_depth * duff_factor
+    litter_duff_total <- litter_mass + duff_mass
+    woody_total <- safe_num1(best$total_woody)
     
     list(
       best = best,
       litter_mass = litter_mass,
       duff_mass = duff_mass,
-      total_mass = litter_mass + duff_mass
+      litter_duff_total = litter_duff_total,
+      total_mass = litter_duff_total + woody_total,
+      fine_woody = safe_num1(best$fine_woody),
+      coarse_woody = safe_num1(best$coarse_woody),
+      total_woody = woody_total,
+      litter_factor = litter_factor,
+      duff_factor = duff_factor,
+      ref_litter_depth = safe_num1(best$litter_depth_ref),
+      ref_duff_depth = safe_num1(best$duff_depth_ref),
+      ref_fuel_height = safe_num1(best$fuel_height_ref),
+      hr1 = safe_num1(best$hr1),
+      hr10 = safe_num1(best$hr10),
+      hr100 = safe_num1(best$hr100)
     )
   })
   
-  output$ai_best_match_text <- renderText({
-    req(best_ai_match())
+  output$ai_best_match_box <- renderUI({
     best <- best_ai_match()
-    paste(best$photo_id[[1]], "-", best$site_type[[1]])
+    img_rel <- safe_chr1(best$image_url, "")
+    
+    if (!nzchar(img_rel)) {
+      return(tags$div("Matched image unavailable."))
+    }
+    
+    tags$div(
+      tags$div(
+        paste(safe_chr1(best$photo_id, "Unknown"), "-", safe_chr1(best$site_type, "Guide photo")),
+        style = "margin-bottom:12px; font-weight:700;"
+      ),
+      tags$div(
+        class = "match-box-photo-wrap",
+        tags$img(
+          src = img_rel,
+          id = "ai_best_match_image_box",
+          class = "match-box-photo",
+          alt = safe_chr1(best$photo_id, "Matched photo")
+        )
+      ),
+      tags$script(HTML(sprintf(
+        "document.getElementById('%s').onclick = function() {
+           Shiny.setInputValue('selected_gallery_image', %s, {priority: 'event'});
+         };",
+        "ai_best_match_image_box",
+        jsonlite::toJSON(list(
+          src = img_rel,
+          label = paste(safe_chr1(best$photo_id, "Unknown"), "-", safe_chr1(best$site_type, "Guide photo")),
+          photo_id = safe_chr1(best$photo_id, "Unknown"),
+          ecozone = safe_chr1(best$ecozone, "Unknown")
+        ), auto_unbox = TRUE)
+      )))
+    )
   })
   
   output$ai_similarity_text <- renderText({
-    req(best_ai_match())
     best <- best_ai_match()
-    paste0(round(best$similarity[[1]], 1), "%")
+    sim_val <- safe_num1(best$similarity)
+    reason_txt <- safe_chr1(best$openai_reason, "")
+    if (is.na(sim_val) && grepl("Local visual shortlist", reason_txt, fixed = TRUE)) {
+      "Local shortlist only"
+    } else if (is.na(sim_val)) {
+      "Similarity unavailable"
+    } else {
+      paste0(round(sim_val, 1), "%")
+    }
+  })
+  
+  output$ai_litter_mass_text <- renderText({
+    calc <- ai_photo_calc()
+    if (is.na(calc$litter_mass)) "Unavailable" else paste0(round(calc$litter_mass, 2), " tons/acre")
+  })
+  
+  output$ai_duff_mass_text <- renderText({
+    calc <- ai_photo_calc()
+    if (is.na(calc$duff_mass)) "Unavailable" else paste0(round(calc$duff_mass, 2), " tons/acre")
   })
   
   output$ai_total_mass_text <- renderText({
-    req(ai_photo_calc())
-    paste0(round(ai_photo_calc()$total_mass, 2), " tons/acre")
+    calc <- ai_photo_calc()
+    if (is.na(calc$total_mass)) "Unavailable" else paste0(round(calc$total_mass, 2), " tons/acre")
+  })
+  
+  output$ai_fine_woody_text <- renderText({
+    calc <- ai_photo_calc()
+    if (is.na(calc$fine_woody)) "Unavailable" else paste0(round(calc$fine_woody, 2), " tons/acre")
+  })
+  
+  output$ai_coarse_woody_text <- renderText({
+    calc <- ai_photo_calc()
+    if (is.na(calc$coarse_woody)) "Unavailable" else paste0(round(calc$coarse_woody, 2), " tons/acre")
+  })
+  
+  output$ai_total_woody_text <- renderText({
+    calc <- ai_photo_calc()
+    if (is.na(calc$total_woody)) "Unavailable" else paste0(round(calc$total_woody, 2), " tons/acre")
   })
   
   output$ai_recommendation <- renderText({
-    req(ai_match_values$recommendation)
-    ai_match_values$recommendation
-  })
-  
-  output$ai_best_match_view <- renderUI({
-    req(best_ai_match())
-    best <- best_ai_match()
-    
-    if (is.na(best$image_url[[1]]) || !file.exists(best$local_path[[1]])) {
-      return(div(class = "warn-missing", "Matched image file not found in www/."))
+    if (is.null(ai_match_values$recommendation) || !nzchar(ai_match_values$recommendation)) {
+      "No recommendation yet."
+    } else {
+      ai_match_values$recommendation
     }
-    
-    div(
-      class = "selected-photo-wrap",
-      tags$h5("Closest Guide Image"),
-      tags$img(src = best$image_url[[1]], alt = best$photo_id[[1]]),
-      br(),
-      tags$p(
-        tags$b("Photo ID: "), best$photo_id[[1]], tags$br(),
-        tags$b("Ecozone: "), best$ecozone[[1]], tags$br(),
-        tags$b("Vegetation: "), best$vegetation_type[[1]], tags$br(),
-        tags$b("Elevation: "), best$elevation_band[[1]], tags$br(),
-        tags$b("Aspect: "), best$aspect_band[[1]], tags$br(),
-        tags$b("Litter factor: "), best$litter_factor[[1]], tags$br(),
-        tags$b("Duff factor: "), best$duff_factor[[1]]
-      )
-    )
   })
   
   output$ai_match_table <- renderDT({
     req(ai_match_values$matches)
     
     table_data <- ai_match_values$matches %>%
+      coalesce_match_metadata(photo_guide_options) %>%
+      normalize_ai_matches() %>%
       mutate(
-        similarity = round(similarity, 1),
-        openai_similarity = round(openai_similarity, 1)
+        Photo = ifelse(
+          is.na(image_url) | image_url == "",
+          "",
+          paste0(
+            "<a href='#' class='ai-match-photo-link' data-row='", dplyr::row_number(), "' ",
+            "onclick='Shiny.setInputValue(\"ai_match_photo_click\", this.dataset.row, {priority: \"event\"}); return false;'>",
+            "<img src='", image_url, "' class='ai-thumb-small'></a>"
+          )
+        ),
+        Similarity = ifelse(is.na(similarity), NA, round(similarity, 1))
       ) %>%
-      select(
-        photo_id, site_type, ecozone, vegetation_type,
-        elevation_band, aspect_band,
-        litter_factor, duff_factor,
-        similarity, openai_reason
-      ) %>%
-      rename(
+      transmute(
+        Photo,
         `Photo ID` = photo_id,
         `Site Type` = site_type,
-        `Ecozone` = ecozone,
-        `Vegetation` = vegetation_type,
-        `Elevation` = elevation_band,
-        `Aspect` = aspect_band,
+        Ecozone = ecozone,
+        Elevation = elevation_band,
+        Aspect = aspect_band,
         `Litter Factor` = litter_factor,
         `Duff Factor` = duff_factor,
-        `Similarity (%)` = similarity,
+        `Fine Woody` = fine_woody,
+        `Coarse Woody` = coarse_woody,
+        `Total Woody` = total_woody,
+        `Similarity (%)` = Similarity,
         `OpenAI Reason` = openai_reason
       )
     
-    datatable(
+    DT::datatable(
       table_data,
-      options = list(pageLength = 5, scrollX = TRUE),
+      escape = FALSE,
+      options = list(pageLength = 5, scrollX = TRUE, autoWidth = TRUE),
       rownames = FALSE
     )
   })
   
-  # ---------------------------
-  # Smoke prediction generate
-  # ---------------------------
-  
   observeEvent(input$predict, {
-    values$status <- "Generating smoke plume prediction..."
+    values$status <- "Generating smoke plume prediction."
     
     req(
       input$latitude, input$longitude,
@@ -1459,6 +2108,7 @@ server <- function(input, output, session) {
       input$consumed_fraction,
       input$wind_speed, input$wind_direction, input$stability,
       input$mixing_height, input$plume_base, input$convective_fraction,
+      input$fuel_moisture,
       input$ignition_method, input$plume_rise_fraction,
       input$flaming_fraction, input$flaming_duration_fraction,
       input$background_pm25
@@ -1476,7 +2126,7 @@ server <- function(input, output, session) {
         acres = input$acres,
         duration_hours = input$duration,
         fuel_type = input$fuel_type,
-        tons_per_acre = input$fuel_load,
+        tons_per_acre = effective_fuel_load(),
         wind_speed = input$wind_speed,
         wind_dir = wind_dir_deg,
         stability_class = input$stability,
@@ -1489,6 +2139,7 @@ server <- function(input, output, session) {
         flaming_fraction = input$flaming_fraction,
         flaming_duration_fraction = input$flaming_duration_fraction,
         background_pm25 = input$background_pm25,
+        fuel_moisture = input$fuel_moisture,
         resolution_km = 0.20
       )
       values$status <- "Prediction complete"
@@ -1639,46 +2290,34 @@ server <- function(input, output, session) {
       rename(
         "Latitude" = lat_grid,
         "Longitude" = lon_grid,
-        "Concentration (µg/m³)" = concentration,
-        "Flaming Contribution (µg/m³)" = concentration_flaming,
-        "Smolder Contribution (µg/m³)" = concentration_smolder,
+        "Total PM2.5 Concentration (µg/m³)" = concentration,
+        "Flaming PM2.5 Contribution (µg/m³)" = concentration_flaming,
+        "Smolder PM2.5 Contribution (µg/m³)" = concentration_smolder,
         "Distance from source (km)" = distance,
         "Downwind distance (km)" = x_rot,
         "Crosswind offset (km)" = y_rot,
         "Plume Top (m)" = H_eff,
         "AQI Band" = aqi_bin
       ) %>%
-      arrange(desc(`Concentration (µg/m³)`)) %>%
+      arrange(desc(`Total PM2.5 Concentration (µg/m³)`)) %>%
       mutate(
         Latitude = round(Latitude, 6),
         Longitude = round(Longitude, 6),
-        `Concentration (µg/m³)` = round(`Concentration (µg/m³)`, 2),
-        `Flaming Contribution (µg/m³)` = round(`Flaming Contribution (µg/m³)`, 2),
-        `Smolder Contribution (µg/m³)` = round(`Smolder Contribution (µg/m³)`, 2),
+        `Total PM2.5 Concentration (µg/m³)` = round(`Total PM2.5 Concentration (µg/m³)`, 2),
+        `Flaming PM2.5 Contribution (µg/m³)` = round(`Flaming PM2.5 Contribution (µg/m³)`, 2),
+        `Smolder PM2.5 Contribution (µg/m³)` = round(`Smolder PM2.5 Contribution (µg/m³)`, 2),
         `Distance from source (km)` = round(`Distance from source (km)`, 2),
         `Downwind distance (km)` = round(`Downwind distance (km)`, 2),
         `Crosswind offset (km)` = round(`Crosswind offset (km)`, 2),
         `Plume Top (m)` = round(`Plume Top (m)`, 1)
       )
     
-    datatable(
+    DT::datatable(
       table_data,
-      options = list(
-        pageLength = 15,
-        scrollX = TRUE,
-        columnDefs = list(list(className = "dt-center", targets = "_all"))
-      ),
+      options = list(pageLength = 10, scrollX = TRUE),
       rownames = FALSE
-    ) %>%
-      formatStyle(
-        "Concentration (µg/m³)",
-        color = styleInterval(
-          c(12, 35.4, 55.4, 150.4, 250.4),
-          c("#1B5E20", "#7A5D00", "#8A4B08", "#8B0000", "#5B2A6D", "#5A1A30")
-        ),
-        fontWeight = "700"
-      )
+    )
   })
 }
 
-shinyApp(ui = ui, server = server)
+shinyApp(ui, server)

@@ -14,7 +14,7 @@ library(rsconnect)
 # OpenAI / image match helpers
 # ---------------------------
 
-Sys.setenv(OPENAI_API_KEY = "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")
+Sys.setenv(OPENAI_API_KEY = "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")
 
 .assert_shiny_fix_dependencies <- function() {
   pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")
@@ -1071,8 +1071,7 @@ ui <- page_sidebar(
     checkboxInput("show_good", "Show low-concentration 'Good' smoke on map", value = FALSE),
     
     br(),
-    actionButton("predict", "Generate Smoke Prediction", class = "btn-primary btn-lg", style = "width: 100%;"),
-    uiOutput("prediction_loading_ui")
+    actionButton("predict", "Generate Smoke Prediction", class = "btn-primary btn-lg", style = "width: 100%;", onclick = "var el=document.getElementById('prediction-loading-overlay'); if (el) el.style.display='flex';")
   ),
   
   tags$head(
@@ -1193,25 +1192,57 @@ ui <- page_sidebar(
         display:block;
         margin:auto;
       }
-      .loading-indicator {
-        display:flex;
-        align-items:center;
-        gap:10px;
-        margin-top:12px;
-        padding:10px 12px;
-        border:1px solid #d8e2e8;
-        border-radius:12px;
-        background:#f8fbfc;
-        color:#334155;
-        font-weight:600;
+      .loading-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(255,255,255,0.45);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 3000;
+        pointer-events: all;
       }
-      .loading-gif {
-        width:36px;
-        height:36px;
-        object-fit:contain;
-        flex:0 0 auto;
-        display:block;
+      .loading-overlay-card {
+        min-width: 260px;
+        max-width: 360px;
+        text-align: center;
+        background: rgba(255,255,255,0.96);
+        border: 1px solid #d8e2e8;
+        border-radius: 18px;
+        padding: 20px 24px;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.14);
       }
+      .loading-overlay-gif {
+        width: 96px;
+        height: 96px;
+        object-fit: contain;
+        display: block;
+        margin: 0 auto 12px auto;
+      }
+      .loading-overlay-text {
+        color: #1f2937;
+        font-weight: 700;
+        font-size: 1rem;
+        line-height: 1.35;
+      }
+    ")),
+    tags$script(HTML("
+      Shiny.addCustomMessageHandler('show_prediction_loader', function(message) {
+        var el = document.getElementById('prediction-loading-overlay');
+        if (el) el.style.display = 'flex';
+      });
+      Shiny.addCustomMessageHandler('hide_prediction_loader', function(message) {
+        var el = document.getElementById('prediction-loading-overlay');
+        if (el) el.style.display = 'none';
+      });
+      Shiny.addCustomMessageHandler('show_ai_loader', function(message) {
+        var el = document.getElementById('ai-loading-overlay');
+        if (el) el.style.display = 'flex';
+      });
+      Shiny.addCustomMessageHandler('hide_ai_loader', function(message) {
+        var el = document.getElementById('ai-loading-overlay');
+        if (el) el.style.display = 'none';
+      });
     "))
   ),
   
@@ -1341,9 +1372,9 @@ ui <- page_sidebar(
             "match_uploaded_photo",
             "Find Closest Guide Photo",
             class = "btn-primary",
-            style = "width: 100%;"
+            style = "width: 100%;",
+            onclick = "var el=document.getElementById('ai-loading-overlay'); if (el) el.style.display='flex';"
           ),
-          uiOutput("ai_loading_ui"),
           br(), br(),
           textOutput("ai_match_status"),
           uiOutput("uploaded_photo_preview")
@@ -1359,10 +1390,6 @@ ui <- page_sidebar(
             uiOutput("ai_best_match_box")
           ),
           
-          div(class = "result-panel result-light",
-              tags$div("Similarity", style = "font-weight:700; margin-bottom:10px;"),
-              textOutput("ai_similarity_text")
-          ),
           div(class = "result-panel result-light",
               tags$div("Litter mass", style = "font-weight:700; margin-bottom:10px;"),
               textOutput("ai_litter_mass_text")
@@ -1441,9 +1468,29 @@ ui <- page_sidebar(
       )
     )
   )
+  ,div(
+    id = "prediction-loading-overlay",
+    class = "loading-overlay",
+    div(
+      class = "loading-overlay-card",
+      tags$img(src = "Loading Circle Animation.gif", class = "loading-overlay-gif"),
+      div(class = "loading-overlay-text", "Generating smoke prediction...")
+    )
+  )
+  ,div(
+    id = "ai-loading-overlay",
+    class = "loading-overlay",
+    div(
+      class = "loading-overlay-card",
+      tags$img(src = "Loading Circle Animation.gif", class = "loading-overlay-gif"),
+      div(class = "loading-overlay-text", "Matching photo and building AI results...")
+    )
+  )
 )
 
 server <- function(input, output, session) {
+  session$sendCustomMessage("hide_prediction_loader", list())
+  session$sendCustomMessage("hide_ai_loader", list())
   
   values <- reactiveValues(
     prediction_data = NULL,
@@ -1496,17 +1543,23 @@ server <- function(input, output, session) {
   output$prediction_loading_ui <- renderUI({
     if (!isTRUE(values$is_generating)) return(NULL)
     div(
-      class = "loading-indicator",
-      tags$img(src = "Loading Circle Animation.gif", class = "loading-gif", alt = "Loading"),
-      span("Generating smoke prediction...")
+      class = "loading-overlay",
+      div(
+        class = "loading-overlay-card",
+        tags$img(src = "Loading Circle Animation.gif", class = "loading-overlay-gif"),
+        div(class = "loading-overlay-text", "Generating smoke prediction...")
+      )
     )
   })
   output$ai_loading_ui <- renderUI({
     if (!isTRUE(ai_match_values$is_generating)) return(NULL)
     div(
-      class = "loading-indicator",
-      tags$img(src = "Loading Circle Animation.gif", class = "loading-gif", alt = "Loading"),
-      span("Matching photo and building AI results...")
+      class = "loading-overlay",
+      div(
+        class = "loading-overlay-card",
+        tags$img(src = "Loading Circle Animation.gif", class = "loading-overlay-gif"),
+        div(class = "loading-overlay-text", "Matching photo and building AI results...")
+      )
     )
   })
   output$selected_fuel_text <- renderText(
@@ -1875,10 +1928,15 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$match_uploaded_photo, {
-    req(input$ai_photo_upload)
+    if (is.null(input$ai_photo_upload)) {
+      session$sendCustomMessage("hide_ai_loader", list())
+      showNotification("Upload a photo first.", type = "message")
+      return(NULL)
+    }
     ai_match_values$is_generating <- TRUE
     on.exit({
       ai_match_values$is_generating <- FALSE
+      session$sendCustomMessage("hide_ai_loader", list())
     }, add = TRUE)
     
     ref_df <- photo_guide_options %>%
@@ -2014,6 +2072,7 @@ server <- function(input, output, session) {
   output$ai_best_match_box <- renderUI({
     best <- best_ai_match()
     img_rel <- safe_chr1(best$image_url, "")
+    reason_txt <- safe_chr1(best$openai_reason, "")
     
     if (!nzchar(img_rel)) {
       return(tags$div("Matched image unavailable."))
@@ -2033,6 +2092,17 @@ server <- function(input, output, session) {
           alt = safe_chr1(best$photo_id, "Matched photo")
         )
       ),
+      if (nzchar(reason_txt)) {
+        tags$div(
+          style = paste(
+            "margin-top:12px; padding:12px; border-radius:10px;",
+            "background:rgba(255,255,255,0.14); color:white;",
+            "line-height:1.45; font-weight:500;"
+          ),
+          tags$div("AI reason", style = "font-weight:700; margin-bottom:6px;"),
+          reason_txt
+        )
+      },
       tags$script(HTML(sprintf(
         "document.getElementById('%s').onclick = function() {
            Shiny.setInputValue('selected_gallery_image', %s, {priority: 'event'});
@@ -2145,6 +2215,7 @@ server <- function(input, output, session) {
     values$is_generating <- TRUE
     on.exit({
       values$is_generating <- FALSE
+      session$sendCustomMessage("hide_prediction_loader", list())
     }, add = TRUE)
     values$status <- "Generating smoke plume prediction."
     

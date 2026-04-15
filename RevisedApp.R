@@ -1367,7 +1367,7 @@ ui <- page_sidebar(
           ),
           numericInput("ai_litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
           numericInput("ai_duff_depth", "Duff depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
-          checkboxInput("show_ai_recommendation", "Show recommendation", value = TRUE),
+          checkboxInput("show_ai_recommendation", "Show recommendation", value = FALSE),
           actionButton(
             "match_uploaded_photo",
             "Find Closest Guide Photo",

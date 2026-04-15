@@ -17,6 +17,7 @@ This app gives prescribed fire planners and land managers a browser-based tool t
 - **Prediction data table** — full grid of predicted concentrations (µg/m³) color-coded by AQI severity band
 - **Duff/Litter fuel calculator** — estimates litter and duff fuel loading (tons/acre) from depth inputs using a photo guide keyed to elevation, aspect, and vegetation type
 - **Model information tab** — in-app documentation of model assumptions, parameters, and limitations
+- **AI Photo Match Calculator** - Uses OpenAI to compare the fuel guide photos to a photo of your choice and finds the closest match. 
 
 ---
 
@@ -106,3 +107,9 @@ The app implements a steady-state Gaussian plume model consistent with VSmoke me
 
 - USDA Forest Service for the original VSmoke model and documentation
 - Course instructors and advisors for the EDS Capstone program at Virginia Tech.
+- Dr. Adam Coates Photo Guide for Estimating Fuel Loading in the Southern Appalachian Mountains
+
+---
+# Future Features 
+
+- Addition of a Topographic map and 3D model

@@ -59,6 +59,13 @@ This app gives prescribed fire planners and land managers a browser-based tool t
 4. Click **Generate Smoke Prediction** to run the model
 5. Explore results across the Map, Data, and Calculator tabs
 
+## How to use the AI Photo Match Calculator 
+1. Upload a photo of your choice that you want to analyze
+2. Input the litter and duff depth
+3. check the "show recommendation" box
+4. select "Find Closest Guide Photo"
+5. View the results on the right panel
+
 ### AQI Concentration Bands
 
 | AQI Category | PM2.5 (µg/m³) |

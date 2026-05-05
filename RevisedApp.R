@@ -14,11 +14,11 @@ library(rsconnect)
 # OpenAI / image match helpers
 # ---------------------------
 
-api_key <- Sys.getenv("OPENAI_API_KEY")
+# Do not hard-code API keys in this file. Set OPENAI_API_KEY in .Renviron or shinyapps.io environment variables.
+# Sys.setenv(OPENAI_API_KEY = Sys.getenv("OPENAI_API_KEY"))
 
-if (!nzchar(api_key)) {
-  stop("OPENAI_API_KEY is not set.")
-}
+Sys.setenv(OPENAI_API_KEY = "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")
+
 .assert_shiny_fix_dependencies <- function() {
   pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")
   missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
@@ -1024,8 +1024,8 @@ ui <- page_sidebar(
       "Fuel loading source:",
       choices = c(
         "Manual entry" = "manual",
-        "Use Duff/Litter total" = "calculator_total",
-        "Use AI photo match total" = "ai_total"
+        "Use Duff/Litter fuel loading source total" = "calculator_total",
+        "Use AI photo match fuel loading source total" = "ai_total"
       ),
       selected = "manual"
     ),
@@ -1295,18 +1295,25 @@ ui <- page_sidebar(
         
         card(
           full_screen = TRUE,
-          card_header("Select Vegetation Type + Photo"),
+          card_header("Select Vegetation / Elevation + Photo"),
           div(class = "calc-note", textOutput("photo_source_text")),
           p(
             class = "calc-note",
-            "Choose a vegetation type first. Then the photo list will filter to matching guide photos only."
+            "Use either vegetation type, elevation band, or both. Leaving one filter on All will only use the filter you do know."
           ),
           
           selectInput(
             "manual_vegetation_type",
             "Vegetation type:",
-            choices = sort(unique(photo_guide_options$vegetation_type)),
-            selected = sort(unique(photo_guide_options$vegetation_type))[1]
+            choices = c("All vegetation types" = "All", sort(unique(photo_guide_options$vegetation_type))),
+            selected = "All"
+          ),
+          
+          selectInput(
+            "manual_elevation_band",
+            "Elevation band:",
+            choices = c("All elevations" = "All", sort(unique(photo_guide_options$elevation_band))),
+            selected = "All"
           ),
           
           numericInput("litter_depth", "Litter depth (inches)", value = 1.0, min = 0, max = 12, step = 0.1),
@@ -1317,7 +1324,7 @@ ui <- page_sidebar(
           
           br(),
           h5("Filtered Photo Gallery"),
-          tags$p(class = "calc-note", "Only photos matching the selected vegetation type are shown below."),
+          tags$p(class = "calc-note", "Photos shown below match whichever filters are selected: vegetation only, elevation only, or both."),
           uiOutput("photo_gallery")
         ),
         
@@ -1363,6 +1370,12 @@ ui <- page_sidebar(
           class = "preview-card",
           tags$h4("Upload a Photo to Match"),
           p("Upload a forest fuel / litter photo. OpenAI will compare it to the guide photos in your www folder and return the closest match. The matched photo supplies the pre-determined woody debris loads, and your litter/duff depths are converted using 1.38 and 4.84 tons/acre/inch."),
+          selectInput(
+            "ai_elevation_band",
+            "Optional elevation filter:",
+            choices = c("All elevations" = "All", sort(unique(photo_guide_options$elevation_band))),
+            selected = "All"
+          ),
           fileInput(
             "ai_photo_upload",
             "Upload photo",
@@ -1587,7 +1600,7 @@ server <- function(input, output, session) {
       if (is.null(calc) || is.null(calc$total_mass) || is.na(calc$total_mass)) {
         return(div(class = "calc-note", tags$strong("Calculator fuel loading source total unavailable."), " Select a calculator photo first."))
       }
-      return(div(class = "calc-note", tags$strong("Using calculator fuel loading source total: "), paste0(round(calc$total_mass, 2), " tons/acre")))
+      return(div(class = "calc-note", tags$strong("Using Duff/Litter fuel loading source total: "), paste0(round(calc$total_mass, 2), " tons/acre")))
     }
     
     calc <- tryCatch(ai_photo_calc(), error = function(e) NULL)
@@ -1614,7 +1627,7 @@ server <- function(input, output, session) {
   
   fuel_load_source_label <- reactive({
     if (identical(input$fuel_load_source, "calculator_total")) {
-      return("Calculator fuel loading source total")
+      return("Duff/Litter fuel loading source total")
     }
     if (identical(input$fuel_load_source, "ai_total")) {
       return("AI photo match fuel loading source total")
@@ -1623,27 +1636,57 @@ server <- function(input, output, session) {
   })
   
   manual_filtered <- reactive({
-    photo_guide_options %>%
-      filter(vegetation_type == input$manual_vegetation_type)
+    filtered <- photo_guide_options
+    
+    if (!is.null(input$manual_vegetation_type) &&
+        nzchar(input$manual_vegetation_type) &&
+        !identical(input$manual_vegetation_type, "All")) {
+      filtered <- filtered %>%
+        filter(vegetation_type == input$manual_vegetation_type)
+    }
+    
+    if (!is.null(input$manual_elevation_band) &&
+        nzchar(input$manual_elevation_band) &&
+        !identical(input$manual_elevation_band, "All")) {
+      filtered <- filtered %>%
+        filter(elevation_band == input$manual_elevation_band)
+    }
+    
+    filtered
   })
   
   output$manual_photo_select_ui <- renderUI({
     filtered <- manual_filtered()
+    
+    if (nrow(filtered) == 0) {
+      return(div(
+        class = "warn-missing",
+        "No guide photos match the selected vegetation/elevation filters. Try setting one filter back to All."
+      ))
+    }
+    
     selectInput(
       "manual_photo_id",
       "Choose photo:",
-      choices = setNames(filtered$photo_id, paste(filtered$photo_id, "-", filtered$site_type, "(", filtered$ecozone, ")")),
+      choices = filtered$photo_id,
       selected = filtered$photo_id[[1]]
     )
   })
   
   selected_photo <- reactive({
     req(input$manual_photo_id)
-    photo_guide_options %>% filter(photo_id == input$manual_photo_id)
+    manual_filtered() %>% filter(photo_id == input$manual_photo_id)
   })
   
   output$photo_gallery <- renderUI({
     filtered <- manual_filtered()
+    
+    if (nrow(filtered) == 0) {
+      return(div(
+        class = "warn-missing",
+        "No photos match the selected filters."
+      ))
+    }
     
     div(
       class = "photo-grid",
@@ -1660,7 +1703,7 @@ server <- function(input, output, session) {
           ),
           div(
             class = "photo-caption",
-            paste(filtered$photo_id[i], "-", filtered$site_type[i])
+            paste(filtered$photo_id[i], "-", filtered$site_type[i], "|", filtered$elevation_band[i])
           ),
           tags$script(HTML(sprintf(
             "document.getElementById('%s').onclick = function() {
@@ -1669,7 +1712,7 @@ server <- function(input, output, session) {
             img_id,
             jsonlite::toJSON(list(
               src = filtered$image_url[i],
-              label = paste(filtered$photo_id[i], "-", filtered$site_type[i]),
+              label = paste(filtered$photo_id[i], "-", filtered$site_type[i], "|", filtered$elevation_band[i]),
               photo_id = filtered$photo_id[i],
               ecozone = filtered$ecozone[i]
             ), auto_unbox = TRUE)
@@ -1763,7 +1806,8 @@ server <- function(input, output, session) {
         paste(
           opt$photo_id[[1]], "-",
           opt$site_type[[1]], "|",
-          opt$vegetation_type[[1]]
+          opt$vegetation_type[[1]], "|",
+          opt$elevation_band[[1]]
         )
       ),
       tags$script(HTML(sprintf(
@@ -1945,11 +1989,18 @@ server <- function(input, output, session) {
     ref_df <- photo_guide_options %>%
       filter(image_exists, !is.na(local_path), file.exists(local_path))
     
+    if (!is.null(input$ai_elevation_band) &&
+        nzchar(input$ai_elevation_band) &&
+        !identical(input$ai_elevation_band, "All")) {
+      ref_df <- ref_df %>%
+        filter(elevation_band == input$ai_elevation_band)
+    }
+    
     if (nrow(ref_df) == 0) {
-      ai_match_values$status <- "No guide photos were found in the www folder."
+      ai_match_values$status <- "No guide photos were found for the selected AI elevation filter."
       ai_match_values$matches <- NULL
       ai_match_values$recommendation <- "No recommendation available."
-      showNotification("No guide photos were found in the www folder.", type = "error")
+      showNotification("No guide photos were found for the selected AI elevation filter.", type = "error")
       return(NULL)
     }
     
@@ -1961,7 +2012,7 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    ai_match_values$status <- "Matching uploaded image with OpenAI."
+    ai_match_values$status <- paste0("Matching uploaded image with OpenAI using ", nrow(ref_df), " guide photos.")
     ai_match_values$matches <- NULL
     ai_match_values$recommendation <- "Waiting for match results."
     
@@ -2225,7 +2276,7 @@ server <- function(input, output, session) {
     req(
       input$latitude, input$longitude,
       input$acres, input$duration,
-      input$fuel_type, input$fuel_load,
+      input$fuel_type,
       input$consumed_fraction,
       input$wind_speed, input$wind_direction, input$stability,
       input$mixing_height, input$plume_base, input$convective_fraction,
@@ -2234,6 +2285,8 @@ server <- function(input, output, session) {
       input$flaming_fraction, input$flaming_duration_fraction,
       input$background_pm25
     )
+    
+    fuel_load_value <- effective_fuel_load()
     
     values$burn_lat <- input$latitude
     values$burn_lon <- input$longitude
@@ -2247,7 +2300,7 @@ server <- function(input, output, session) {
         acres = input$acres,
         duration_hours = input$duration,
         fuel_type = input$fuel_type,
-        tons_per_acre = effective_fuel_load(),
+        tons_per_acre = fuel_load_value,
         wind_speed = input$wind_speed,
         wind_dir = wind_dir_deg,
         stability_class = input$stability,
@@ -2263,7 +2316,12 @@ server <- function(input, output, session) {
         fuel_moisture = input$fuel_moisture,
         resolution_km = 0.20
       )
-      values$status <- "Prediction complete"
+      values$status <- paste0(
+        "Prediction complete — using ",
+        round(fuel_load_value, 2),
+        " tons/acre from ",
+        fuel_load_source_label()
+      )
     }, error = function(e) {
       values$status <- paste("Error generating prediction:", e$message)
       showNotification("Error generating smoke prediction. Please check inputs.", type = "error")
@@ -2442,3 +2500,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+

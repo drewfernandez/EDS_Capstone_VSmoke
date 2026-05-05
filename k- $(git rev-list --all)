@@ -1,0 +1,277 @@
+[33mcommit a0750b7a6f7cfb77628760d4cfdf2e859933ca3a[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: Matteo Pivato <mattewolf2015@gmail.com>
+Date:   Tue Mar 31 03:50:17 2026 -0400
+
+    Updated app, and now at its final stage
+
+[1mdiff --git a/App.R b/App.R[m
+[1mindex cb12209..a527d68 100644[m
+[1m--- a/App.R[m
+[1m+++ b/App.R[m
+[36m@@ -3,133 +3,781 @@[m [mlibrary(tidyverse)[m
+ library(DT)[m
+ library(bslib)[m
+ library(leaflet)[m
+[32m+[m[32mlibrary(htmltools)[m[41m[m
+[32m+[m[32mlibrary(httr2)[m[41m[m
+[32m+[m[32mlibrary(jsonlite)[m[41m[m
+[32m+[m[32mlibrary(base64enc)[m[41m[m
+ [m
+[31m-# Gaussian Dispersion Model Functions[m
+[31m-# Based on VSmoke methodology for prescribed burn smoke prediction[m
+[31m-[m
+[31m-# Stability class parameters for Pasquill-Gifford stability categories[m
+[31m-stability_params <- list([m
+[31m-  "A" = list(a = 0.527, b = 0.865, c = 0.28, d = 0.90),   # Very unstable[m
+[31m-  "B" = list(a = 0.371, b = 0.866, c = 0.23, d = 0.85),   # Moderately unstable[m
+[31m-  "C" = list(a = 0.209, b = 0.897, c = 0.22, d = 0.80),   # Slightly unstable[m
+[31m-  "D" = list(a = 0.128, b = 0.905, c = 0.20, d = 0.76),   # Neutral[m
+[31m-  "E" = list(a = 0.098, b = 0.902, c = 0.15, d = 0.73),   # Slightly stable[m
+[31m-  "F" = list(a = 0.065, b = 0.902, c = 0.12, d = 0.67)    # Moderately stable[m
+[32m+[m[32m# ---------------------------[m[41m[m
+[32m+[m[32m# OpenAI / image match helpers[m[41m[m
+[32m+[m[32m# ---------------------------[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mSys.setenv(OPENAI_API_KEY = "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")[m[41m[m
+[32m+[m[32m.assert_shiny_fix_dependencies <- function() {[m[41m[m
+[32m+[m[32m  pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")[m[41m[m
+[32m+[m[32m  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)][m[41m[m
+[32m+[m[32m  if (length(missing) > 0) {[m[41m[m
+[32m+[m[32m    stop(paste("Missing required packages:", paste(missing, collapse = ", ")), call. = FALSE)[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[32m  invisible(TRUE)[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mretry_openai_request <- function(expr_fn, max_attempts = 4, base_sleep = 0.7) {[m[41m[m
+[32m+[m[32m  for (attempt in seq_len(max_attempts)) {[m[41m[m
+[32m+[m[32m    result <- tryCatch(expr_fn(), error = function(e) e)[m[41m[m
+[32m+[m[41m    [m
+[32m+[m[32m    if (!inherits(result, "error")) {[m[41m[m
+[32m+[m[32m      return(result)[m[41m[m
+[32m+[m[32m    }[m[41m[m
+[32m+[m[41m    [m
+[32m+[m[32m    msg <- conditionMessage(result)[m[41m[m
+[32m+[m[41m    [m
+[32m+[m[32m    if (!grepl("429|rate limit", msg, ignore.case = TRUE) || attempt == max_attempts) {[m[41m[m
+[32m+[m[32m      stop(result)[m[41m[m
+[32m+[m[32m    }[m[41m[m
+[32m+[m[41m    [m
+[32m+[m[32m    Sys.sleep(base_sleep * attempt)[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mextract_chat_text <- function(resp_json) {[m[41m[m
+[32m+[m[32m  if (!is.null(resp_json$choices) &&[m[41m[m
+[32m+[m[32m      length(resp_json$choices) >= 1 &&[m[41m[m
+[32m+[m[32m      !is.null(resp_json$choices[[1]]$message$content)) {[m[41m[m
+[32m+[m[32m    return(trimws(resp_json$choices[[1]]$message$content))[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[32m  ""[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mopenai_chat_raw <- function(model, messages, temperature = 0, max_completion_tokens = 120) {[m[41m[m
+[32m+[m[32m  api_key <- Sys.getenv("OPENAI_API_KEY", unset = "")[m[41m[m
+[32m+[m[32m  if (!nzchar(api_key)) {[m[41m[m
+[32m+[m[32m    stop("OPENAI_API_KEY is not set.")[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  body <- list([m[41m[m
+[32m+[m[32m    model = model,[m[41m[m
+[32m+[m[32m    messages = messages,[m[41m[m
+[32m+[m[32m    temperature = temperature,[m[41m[m
+[32m+[m[32m    max_completion_tokens = max_completion_tokens[m[41m[m
+[32m+[m[32m  )[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  retry_openai_request(function() {[m[41m[m
+[32m+[m[32m    resp <- httr2::request("https://api.openai.com/v1/chat/completions") |>[m[41m[m
+[32m+[m[32m      httr2::req_headers([m[41m[m
+[32m+[m[32m        Authorization = paste("Bearer", api_key),[m[41m[m
+[32m+[m[32m        `Content-Type` = "application/json"[m[41m[m
+[32m+[m[32m      ) |>[m[41m[m
+[32m+[m[32m      httr2::req_body_json(body, auto_unbox = TRUE) |>[m[41m[m
+[32m+[m[32m      httr2::req_timeout(120) |>[m[41m[m
+[32m+[m[32m      httr2::req_perform()[m[41m[m
+[32m+[m[41m    [m
+[32m+[m[32m    httr2::resp_body_json(resp, simplifyVector = FALSE)[m[41m[m
+[32m+[m[32m  })[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mask_openai_assistant <- function(prompt, top_matches, model = "gpt-5.4-mini") {[m[41m[m
+[32m+[m[32m  top_matches <- normalize_ai_matches(top_matches)[m[41m[m
+[32m+[m[32m  if (nrow(top_matches) == 0) {[m[41m[m
+[32m+[m[32m    return("OpenAI recommendation error: no match results were available.")[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  match_lines <- paste0([m[41m[m
+[32m+[m[32m    top_matches$photo_id,[m[41m[m
+[32m+[m[32m    " | ",[m[41m[m
+[32m+[m[32m    top_matches$site_type,[m[41m[m
+[32m+[m[32m    " | similarity=",[m[41m[m
+[32m+[m[32m    ifelse(is.na(top_matches$similarity), "NA", sprintf("%.1f", top_matches$similarity)),[m[41m[m
+[32m+[m[32m    "%"[m[41m[m
+[32m+[m[32m  )[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  user_content <- paste([m[41m[m
+[32m+[m[32m    "User request:", prompt,[m[41m[m
+[32m+[m[32m    "\nTop matched guide photos:\n", paste0("- ", match_lines, collapse = "\n"),[m[41m[m
+[32m+[m[32m    "\nGive a concise recommendation for which output photo to use and why."[m[41m[m
+[32m+[m[32m  )[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  response <- tryCatch([m[41m[m
+[32m+[m[32m    openai_chat_raw([m[41m[m
+[32m+[m[32m      model = model,[m[41m[m
+[32m+[m[32m      temperature = 0.2,[m[41m[m
+[32m+[m[32m      max_completion_tokens = 120,[m[41m[m
+[32m+[m[32m      messages = list([m[41m[m
+[32m+[m[32m        list([m[41m[m
+[32m+[m[32m          role = "system",[m[41m[m
+[32m+[m[32m          content = "You are a wildfire fuel photo assistant. Be brief, practical, and safety-minded."[m[41m[m
+[32m+[m[32m        ),[m[41m[m
+[32m+[m[32m        list([m[41m[m
+[32m+[m[32m          role = "user",[m[41m[m
+[32m+[m[32m          content = user_content[m[41m[m
+[32m+[m[32m        )[m[41m[m
+[32m+[m[32m      )[m[41m[m
+[32m+[m[32m    ),[m[41m[m
+[32m+[m[32m    error = function(e) {[m[41m[m
+[32m+[m[32m      structure(list(.error = e$message), class = "openai_error_wrapper")[m[41m[m
+[32m+[m[32m    }[m[41m[m
+[32m+[m[32m  )[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  if (!is.null(response$.error)) {[m[41m[m
+[32m+[m[32m    err <- as.character(response$.error)[m[41m[m
+[32m+[m[32m    if (grepl("429|rate limit", err, ignore.case = TRUE)) {[m[41m[m
+[32m+[m[32m      return("Recommendation skipped because the OpenAI rate limit was reached. The top match results below are still usable.")[m[41m[m
+[32m+[m[32m    }[m[41m[m
+[32m+[m[32m    return(paste("OpenAI recommendation error:", err))[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  txt <- extract_chat_text(response)[m[41m[m
+[32m+[m[32m  if (nzchar(txt)) txt else "OpenAI returned no recommendation text."[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32msafe_chr1 <- function(x, default = "") {[m[41m[m
+[32m+[m[32m  if (is.null(x) || length(x) == 0) return(default)[m[41m[m
+[32m+[m[32m  x <- as.character(x[[1]])[m[41m[m
+[32m+[m[32m  if (is.na(x) || !nzchar(x)) default else x[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32msafe_num1 <- function(x, default = NA_real_) {[m[41m[m
+[32m+[m[32m  if (is.null(x) || length(x) == 0) return(default)[m[41m[m
+[32m+[m[32m  out <- suppressWarnings(as.numeric(x[[1]]))[m[41m[m
+[32m+[m[32m  if (length(out) == 0 || is.na(out)) default else out[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mcoalesce_match_metadata <- function(matches_df, reference_df = photo_guide_options) {[m[41m[m
+[32m+[m[32m  if (is.null(matches_df) || !is.data.frame(matches_df) || nrow(matches_df) == 0) {[m[41m[m
+[32m+[m[32m    return(tibble::tibble())[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  out <- tibble::as_tibble(matches_df)[m[41m[m
+[32m+[m[32m  ref <- tibble::as_tibble(reference_df)[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  if (!"photo_id" %in% names(out) || !"photo_id" %in% names(ref)) {[m[41m[m
+[32m+[m[32m    return(out)[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  ref_small <- ref %>%[m[41m[m
+[32m+[m[32m    dplyr::select([m[41m[m
+[32m+[m[32m      photo_id, site_type, ecozone, vegetation_type,[m[41m[m
+[32m+[m[32m      elevation_band, aspect_band, litter_factor, duff_factor,[m[41m[m
+[32m+[m[32m      image_url, local_path, image_exists[m[41m[m
+[32m+[m[32m    )[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  joined <- dplyr::left_join(out, ref_small, by = "photo_id", suffix = c("", ".ref"))[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  pick_col <- function(df, primary, fallback = NULL, default = NULL) {[m[41m[m
+[32m+[m[32m    has_primary <- primary %in% names(df)[m[41m[m
+[32m+[m[32m    has_fallback <- !is.null(fallback) && fallback %in% names(df)[m[41m[m
+[32m+[m[41m    [m
+[32m+[m[32m    if (has_primary && has_fallback) {[m[41m[m
+[32m+[m[32m      dplyr::coalesce(df[[primary]], df[[fallback]])[m[41m[m
+[32m+[m[32m    } else if (has_primary) {[m[41m[m
+[32m+[m[32m      df[[primary]][m[41m[m
+[32m+[m[32m    } else if (has_fallback) {[m[41m[m
+[32m+[m[32m      df[[fallback]][m[41m[m
+[32m+[m[32m    } else {[m[41m[m
+[32m+[m[32m      rep(default, nrow(df))[m[41m[m
+[32m+[m[32m    }[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  joined %>%[m[41m[m
+[32m+[m[32m    dplyr::mutate([m[41m[m
+[32m+[m[32m      site_type       = pick_col(., "site_type", "site_type.ref", "Guide photo"),[m[41m[m
+[32m+[m[32m      ecozone         = pick_col(., "ecozone", "ecozone.ref", NA_character_),[m[41m[m
+[32m+[m[32m      vegetation_type = pick_col(., "vegetation_type", "vegetation_type.ref", NA_character_),[m[41m[m
+[32m+[m[32m      elevation_band  = pick_col(., "elevation_band", "elevation_band.ref", NA_character_),[m[41m[m
+[32m+[m[32m      aspect_band     = pick_col(., "aspect_band", "aspect_band.ref", NA_character_),[m[41m[m
+[32m+[m[32m      litter_factor   = suppressWarnings(as.numeric(pick_col(., "litter_factor", "litter_factor.ref", NA_real_))),[m[41m[m
+[32m+[m[32m      duff_factor     = suppressWarnings(as.numeric(pick_col(., "duff_factor", "duff_factor.ref", NA_real_))),[m[41m[m
+[32m+[m[32m      image_url       = pick_col(., "image_url", "image_url.ref", NA_character_),[m[41m[m
+[32m+[m[32m      local_path      = pick_col(., "local_path", "local_path.ref", NA_character_),[m[41m[m
+[32m+[m[32m      image_exists    = pick_col(., "image_exists", "image_exists.ref", FALSE)[m[41m[m
+[32m+[m[32m    ) %>%[m[41m[m
+[32m+[m[32m    dplyr::select(-dplyr::any_of(c([m[41m[m
+[32m+[m[32m      "site_type.ref", "ecozone.ref", "vegetation_type.ref",[m[41m[m
+[32m+[m[32m      "elevation_band.ref", "aspect_band.ref",[m[41m[m
+[32m+[m[32m      "litter_factor.ref", "duff_factor.ref",[m[41m[m
+[32m+[m[32m      "image_url.ref", "local_path.ref", "image_exists.ref"[m[41m[m
+[32m+[m[32m    )))[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mnormalize_ai_matches <- function(df) {[m[41m[m
+[32m+[m[32m  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {[m[41m[m
+[32m+[m[32m    return(tibble::tibble())[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  out <- tibble::as_tibble(df)[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  if (!"photo_id" %in% names(out)) out$photo_id <- NA_character_[m[41m[m
+[32m+[m[32m  if (!"site_type" %in% names(out)) out$site_type <- "Guide photo"[m[41m[m
+[32m+[m[32m  if (!"ecozone" %in% names(out)) out$ecozone <- NA_character_[m[41m[m
+[32m+[m[32m  if (!"vegetation_type" %in% names(out)) out$vegetation_type <- NA_character_[m[41m[m
+[32m+[m[32m  if (!"elevation_band" %in% names(out)) out$elevation_band <- NA_character_[m[41m[m
+[32m+[m[32m  if (!"aspect_band" %in% names(out)) out$aspect_band <- NA_character_[m[41m[m
+[32m+[m[32m  if (!"litter_factor" %in% names(out)) out$litter_factor <- NA_real_[m[41m[m
+[32m+[m[32m  if (!"duff_factor" %in% names(out)) out$duff_factor <- NA_real_[m[41m[m
+[32m+[m[32m  if (!"image_url" %in% names(out)) out$image_url <- NA_character_[m[41m[m
+[32m+[m[32m  if (!"local_path" %in% names(out)) out$local_path <- NA_character_[m[41m[m
+[32m+[m[32m  if (!"openai_reason" %in% names(out)) out$openai_reason <- ""[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  if ("similarity" %in% names(out)) {[m[41m[m
+[32m+[m[32m    out$similarity <- suppressWarnings(as.numeric(out$similarity))[m[41m[m
+[32m+[m[32m  } else if ("openai_similarity" %in% names(out)) {[m[41m[m
+[32m+[m[32m    out$similarity <- suppressWarnings(as.numeric(out$openai_similarity))[m[41m[m
+[32m+[m[32m  } else {[m[41m[m
+[32m+[m[32m    out$similarity <- NA_real_[m[41m[m
+[32m+[m[32m  }[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  out$photo_id <- as.character(out$photo_id)[m[41m[m
+[32m+[m[32m  out$site_type <- ifelse(is.na(out$site_type) | !nzchar(as.character(out$site_type)), "Guide photo", as.character(out$site_type))[m[41m[m
+[32m+[m[32m  out$ecozone <- as.character(out$ecozone)[m[41m[m
+[32m+[m[32m  out$vegetation_type <- as.character(out$vegetation_type)[m[41m[m
+[32m+[m[32m  out$elevation_band <- as.character(out$elevation_band)[m[41m[m
+[32m+[m[32m  out$aspect_band <- as.character(out$aspect_band)[m[41m[m
+[32m+[m[32m  out$image_url <- as.character(out$image_url)[m[41m[m
+[32m+[m[32m  out$local_path <- as.character(out$local_path)[m[41m[m
+[32m+[m[32m  out$litter_factor <- suppressWarnings(as.numeric(out$litter_factor))[m[41m[m
+[32m+[m[32m  out$duff_factor <- suppressWarnings(as.numeric(out$duff_factor))[m[41m[m
+[32m+[m[32m  out$openai_reason <- as.character(out$openai_reason)[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  dplyr::arrange(out, dplyr::desc(similarity))[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32msafe_img_vector <- function(path, size = 96) {[m[41m[m
+[32m+[m[32m  .assert_shiny_fix_dependencies()[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  img <- magick::image_read(path) |>[m[41m[m
+[32m+[m[32m    magick::image_resize(sprintf("%dx%d!", size, size)) |>[m[41m[m
+[32m+[m[32m    magick::image_convert(colorspace = "Gray")[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  as.numeric(magick::image_data(img, channels = "gray"))[m[41m[m
+[32m+[m[32m}[m[41m[m
+[32m+[m[41m[m
+[32m+[m[32mfind_candidate_matches_local <- function(upload_path, reference_df, top_n = 20) {[m[41m[m
+[32m+[m[32m  .assert_shiny_fix_dependencies()[m[41m[m
+[32m+[m[41m  [m
+[32m+[m[32m  up_vec <- safe_img_vector(upload_path)

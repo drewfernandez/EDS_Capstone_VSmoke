@@ -17,7 +17,7 @@ library(rsconnect)
 # Do not hard-code API keys in this file. Set OPENAI_API_KEY in .Renviron or shinyapps.io environment variables.
 # Sys.setenv(OPENAI_API_KEY = Sys.getenv("OPENAI_API_KEY"))
 
-Sys.setenv(OPENAI_API_KEY = "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")
+Sys.setenv(OPENAI_API_KEY = "Input_API_Key ")
 
 .assert_shiny_fix_dependencies <- function() {
   pkgs <- c("magick", "dplyr", "tibble", "purrr", "jsonlite", "base64enc", "httr2")
